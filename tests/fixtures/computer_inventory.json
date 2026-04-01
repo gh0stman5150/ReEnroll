@@ -1,0 +1,7 @@
+{
+  "general": {
+    "name": "Test Computer",
+    "managementId": "mdm-12345"
+  },
+  "managementId": "mdm-12345"
+}
