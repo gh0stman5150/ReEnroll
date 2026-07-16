@@ -272,7 +272,7 @@ sourceModule "enrollment.zsh"
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
 function makePath() {
-    mkdir -p "$(sed 's/\(.*\)\/.*/\1/' <<< $1)"
+    mkdir -p "$(sed 's/\(.*\)\/.*/\1/' <<< "$1")"
     notice "Path made: $1"
 }
 
@@ -307,7 +307,7 @@ function prepareRuntimeArtifacts() {
     fi
 
     duplicate_log_dir=$( mktemp -d /var/tmp/jamfTemp.XXXXXX )
-    chmod 655 "$duplicate_log_dir"
+    chmod 700 "$duplicate_log_dir"
 
     if [[ ! -f "${tempInventoryLog}" ]]; then
         touch "${tempInventoryLog}"
@@ -447,7 +447,7 @@ function verifyLastPosition(){
         echo "$lastPosition" > "$marker_file"
 
         # Check if last position is less than or equal to zero
-        if [[ ! -f "{$jamfLogFile}" ]] || [[ "${lastPosition}" -le 0 ]]; then
+        if [[ ! -f "${jamfLogFile}" ]] || [[ "${lastPosition}" -le 0 ]]; then
             preFlight "Last position is less than one or jamf log doesn't exist. Creating position."
             createLastLogPosition
         else

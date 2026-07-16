@@ -118,7 +118,7 @@ function computerIDLookup() {
 
 function computerInventoryInfo() {
 
-    generalComputerInfo=$(/usr/bin/curl -H "Authorization: Bearer ${apiBearerToken}" -H "Accept: text/xml" -sfk "${jssurl}JSSResource/computers/id/${computerID}/subset/General" -X GET)
+    generalComputerInfo=$(/usr/bin/curl -H "Authorization: Bearer ${apiBearerToken}" -H "Accept: text/xml" -sf "${jssurl}JSSResource/computers/id/${computerID}/subset/General" -X GET)
     check_status "$generalComputerInfo"
     if [ "$APIResult" = "Failure" ]; then
         errorOut "Failed to get general computer info, error: $APIResult"
@@ -126,7 +126,7 @@ function computerInventoryInfo() {
         infoOut "Successfully gathered general computer info, result: $APIResult"
     fi
 
-    hardwareComputerInfo=$(/usr/bin/curl -H "Authorization: Bearer ${apiBearerToken}" -H "Accept: text/xml" -sfk "${jssurl}JSSResource/computers/id/${computerID}/subset/Hardware" -X GET)
+    hardwareComputerInfo=$(/usr/bin/curl -H "Authorization: Bearer ${apiBearerToken}" -H "Accept: text/xml" -sf "${jssurl}JSSResource/computers/id/${computerID}/subset/Hardware" -X GET)
     check_status "$hardwareComputerInfo"
     if [ "$APIResult" = "Failure" ]; then
         errorOut "Failed to get hardware computer info, error: $APIResult"
