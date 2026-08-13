@@ -43,9 +43,58 @@ function extract_from_json() {
   '
 }
 
-function check_token() {
+function get_json_path() {
+    JSON="$1" JSON_PATH="$2" /usr/bin/osascript -l JavaScript \
+        -e 'const env = $.NSProcessInfo.processInfo.environment' \
+        -e 'let value = JSON.parse(env.objectForKey("JSON").js)' \
+        -e 'for (const part of env.objectForKey("JSON_PATH").js.split(".")) { value = value[part.match(/^\d+$/) ? Number(part) : part] }' \
+        -e 'if (value === undefined || value === null) { $.exit(1) }' \
+        -e 'typeof value === "object" ? JSON.stringify(value) : String(value)'
+}
 
-    apitokenCheck=$(/usr/bin/curl --write-out "%{http_code}" --silent --output /dev/null "${jssurl}api/v1/auth" --request GET --header "Authorization: Bearer ${apiBearerToken}")
+function jamfApiRequest() {
+    emulate -L zsh
+    local method="$1"
+    local url="$2"
+    local bodyFile status curlExit
+    local -a curlArgs
+    shift 2
+
+    JAMF_HTTP_BODY=""
+    JAMF_HTTP_STATUS="000"
+    JAMF_HTTP_CURL_EXIT=0
+    bodyFile=$(/usr/bin/mktemp /var/tmp/reenroll-http.XXXXXX) || return 1
+    curlArgs=(
+        --silent
+        --show-error
+        --location
+        --proto '=https'
+        --proto-redir '=https'
+        --connect-timeout 10
+        --max-time 120
+        --output "${bodyFile}"
+        --write-out '%{http_code}'
+        --request "${method}"
+    )
+    if [[ "${method}" == "GET" || "${method}" == "HEAD" ]]; then
+        curlArgs+=(--retry 3 --retry-delay 2)
+    fi
+
+    status=$(/usr/bin/curl "${curlArgs[@]}" "$@" "${url}")
+    curlExit=$?
+    JAMF_HTTP_BODY="$(<"${bodyFile}")"
+    /bin/rm -f -- "${bodyFile}"
+    JAMF_HTTP_STATUS="${status:-000}"
+    JAMF_HTTP_CURL_EXIT="${curlExit}"
+
+    (( curlExit == 0 )) || return 1
+    [[ "${JAMF_HTTP_STATUS}" == <200-299> ]]
+}
+
+function check_token() {
+    jamfApiRequest GET "${jssurl}api/v1/auth" \
+        --header "Authorization: Bearer ${apiBearerToken}" || true
+    apitokenCheck="${JAMF_HTTP_STATUS}"
     infoOut "API Bearer Token Check: ${apitokenCheck}"
     case ${apitokenCheck} in
         200)
@@ -72,7 +121,8 @@ function check_token() {
 }
 
 function check_status() {
-    if [[ $1 == *"Bad Request"* || $1 == *"httpStatus"* || $1 == *"Access Denied"* || $1 == *"Status page"* ]]; then
+    local status="${1:-${JAMF_HTTP_STATUS:-000}}"
+    if [[ "${status}" != <200-299> ]]; then
         APIResult="Failure"
     else
         APIResult="Command Sent"
@@ -80,36 +130,56 @@ function check_status() {
 }
 
 function apiResponse() {
-    response=$(/usr/bin/curl -s -X GET \
-        -H "Authorization: Bearer $apiBearerToken" \
-        -H "Accept: application/xml" \
-        "${jssurl}JSSResource/computers/serialnumber/$serialNumber")
+    local version
+    local -a versions
+
+    versions=(v3 v2 v1)
+    for version in "${versions[@]}"; do
+        if jamfApiRequest GET "${jssurl}api/${version}/computers-inventory" \
+            --header "Authorization: Bearer ${apiBearerToken}" \
+            --header "Accept: application/json" \
+            --get \
+            --data-urlencode "filter=hardware.serialNumber==\"${serialNumber}\"" \
+            --data-urlencode "page-size=1"; then
+            response="${JAMF_HTTP_BODY}"
+            computerID="$(get_json_path "${response}" "results.0.id" 2>/dev/null || true)"
+            if [[ -n "${computerID}" ]]; then
+                jamfInventoryApiVersion="${version}"
+                infoOut "Using Jamf Pro computer inventory API ${version}."
+                return 0
+            fi
+        fi
+
+        if [[ "${JAMF_HTTP_STATUS}" != "400" && "${JAMF_HTTP_STATUS}" != "404" ]]; then
+            break
+        fi
+    done
+
+    error "Unable to find this computer through a supported Jamf Pro inventory API (HTTP ${JAMF_HTTP_STATUS})."
+    return 1
 }
 
 function computerIDLookup() {
-
-    computerID=$(echo "$response" | xmllint --xpath 'string(/computer/general/id)' - | sed 's/[^0-9]*//g')
-
     if [[ "$debugMode" = "verbose" ]]; then
         debugVerbose "Computer ID: $computerID"
     fi
 
-    managmentIDAPI=$(/usr/bin/curl -s -X GET \
-        -H "Authorization: Bearer $apiBearerToken" \
-        -H "accept: application/json" \
-        "${jssurl}api/v1/computers-inventory-detail/$computerID")
-    check_status "$managmentIDAPI"
-    if [ "$APIResult" = "Failure" ]; then
-        errorOut "Failed to gather computer inventory, error: $APIResult"
-    else
-        infoOut "Successfully gathered computer inventory, result: $APIResult"
+    if ! jamfApiRequest GET "${jssurl}api/${jamfInventoryApiVersion}/computers-inventory/${computerID}" \
+        --header "Authorization: Bearer ${apiBearerToken}" \
+        --header "Accept: application/json" \
+        --get \
+        --data-urlencode "section=GENERAL" \
+        --data-urlencode "section=HARDWARE"; then
+        APIResult="Failure"
+        error "Failed to gather computer inventory (HTTP ${JAMF_HTTP_STATUS})."
+        return 1
     fi
 
-    management_id=$(extract_from_json "$managmentIDAPI" "managementId")
-
-    if [ -z "$management_id" ]; then
-        management_id=$(extract_from_json "$managmentIDAPI" "general:managementId")
-    fi
+    inventoryDetailJson="${JAMF_HTTP_BODY}"
+    APIResult="Command Sent"
+    infoOut "Successfully gathered computer inventory."
+    management_id="$(get_json_path "${inventoryDetailJson}" "general.managementId" 2>/dev/null || true)"
+    [[ -n "${management_id}" ]] || management_id="$(get_json_path "${inventoryDetailJson}" "managementId" 2>/dev/null || true)"
 
     if [[ "$debugMode" = "verbose" ]]; then
         debugVerbose "Management ID: $management_id"
@@ -117,30 +187,13 @@ function computerIDLookup() {
 }
 
 function computerInventoryInfo() {
-
-    generalComputerInfo=$(/usr/bin/curl -H "Authorization: Bearer ${apiBearerToken}" -H "Accept: text/xml" -sf "${jssurl}JSSResource/computers/id/${computerID}/subset/General" -X GET)
-    check_status "$generalComputerInfo"
-    if [ "$APIResult" = "Failure" ]; then
-        errorOut "Failed to get general computer info, error: $APIResult"
-    else
-        infoOut "Successfully gathered general computer info, result: $APIResult"
-    fi
-
-    hardwareComputerInfo=$(/usr/bin/curl -H "Authorization: Bearer ${apiBearerToken}" -H "Accept: text/xml" -sf "${jssurl}JSSResource/computers/id/${computerID}/subset/Hardware" -X GET)
-    check_status "$hardwareComputerInfo"
-    if [ "$APIResult" = "Failure" ]; then
-        errorOut "Failed to get hardware computer info, error: $APIResult"
-    else
-        infoOut "Successfully gathered hardware computer info, result: $APIResult"
-    fi
-
-    computerName=$(echo "${generalComputerInfo}" | xpath -q -e "/computer/general/name/text()")
-    computerSerialNumber=$(echo "${generalComputerInfo}" | xpath -q -e "/computer/general/serial_number/text()")
-    computerModel=$(echo "${hardwareComputerInfo}" | xpath -q -e "/computer/hardware/model/text()")
-    computerIpAddress=$(echo "${generalComputerInfo}" | xpath -q -e "/computer/general/ip_address/text()")
-    computerIpAddressLastReported=$(echo "${generalComputerInfo}" | xpath -q -e "/computer/general/last_reported_ip/text()")
-    computerSite=$(echo "${generalComputerInfo}" | xpath -q -e "/computer/general/site/name/text()")
-    computerSiteID=$(echo "${generalComputerInfo}" | xpath -q -e "/computer/general/site/id/text()")
+    computerName="$(get_json_path "${inventoryDetailJson}" "general.name" 2>/dev/null || true)"
+    computerSerialNumber="$(get_json_path "${inventoryDetailJson}" "hardware.serialNumber" 2>/dev/null || true)"
+    computerModel="$(get_json_path "${inventoryDetailJson}" "hardware.model" 2>/dev/null || true)"
+    computerIpAddress="$(get_json_path "${inventoryDetailJson}" "general.lastIpAddress" 2>/dev/null || true)"
+    computerIpAddressLastReported="$(get_json_path "${inventoryDetailJson}" "general.lastReportedIp" 2>/dev/null || true)"
+    computerSite="$(get_json_path "${inventoryDetailJson}" "general.site.name" 2>/dev/null || true)"
+    computerSiteID="$(get_json_path "${inventoryDetailJson}" "general.site.id" 2>/dev/null || true)"
 
     infoOut "Computer Site ID: $computerSiteID"
     infoOut "Adding computer site ID to ReEnroll Config File"
@@ -174,8 +227,10 @@ function clearFailedCommands() {
     fi
 
     notice "Brute-force clear all failed MDM Commands"
-    clearFailedCommandsResult=$(/usr/bin/curl -H "Authorization: Bearer ${apiBearerToken}" "${jssurl}JSSResource/commandflush/computers/id/${computerID}/status/Failed" -X DELETE)
-    check_status "$clearFailedCommandsResult"
+    jamfApiRequest DELETE "${jssurl}JSSResource/commandflush/computers/id/${computerID}/status/Failed" \
+        --header "Authorization: Bearer ${apiBearerToken}" || true
+    clearFailedCommandsResult="${JAMF_HTTP_BODY}"
+    check_status "${JAMF_HTTP_STATUS}"
 
     if [ "$APIResult" = "Failure" ]; then
         errorOut "Failed to clear all failed MDM Commands, error: $APIResult"
@@ -210,8 +265,11 @@ function redeployJamfFramework() {
     fi
 
     notice "Redeploy Jamf binary"
-    redeployResult=$(/usr/bin/curl -H "Authorization: Bearer ${apiBearerToken}" -H "accept: application/json" --progress-bar --fail-with-body "${jssurl}api/v1/jamf-management-framework/redeploy/${computerID}" -X POST)
-    check_status "$redeployResult"
+    jamfApiRequest POST "${jssurl}api/v1/jamf-management-framework/redeploy/${computerID}" \
+        --header "Authorization: Bearer ${apiBearerToken}" \
+        --header "Accept: application/json" || true
+    redeployResult="${JAMF_HTTP_BODY}"
+    check_status "${JAMF_HTTP_STATUS}"
     state_set "ReEnrollMethod" "Redeploy Jamf Framework"
 
     if [ "$displayReEnrollDialog" = "true" ]; then
@@ -236,16 +294,24 @@ function getAccessToken() {
         return 0
     fi
 
-    tokenResponse=$(curl --silent --location --request POST "${jssurl}api/oauth/token" \
+    if ! jamfApiRequest POST "${jssurl}api/oauth/token" \
         --header "Content-Type: application/x-www-form-urlencoded" \
         --data-urlencode "client_id=${client_id}" \
         --data-urlencode "grant_type=client_credentials" \
-        --data-urlencode "client_secret=${client_secret}")
+        --data-urlencode "client_secret=${client_secret}"; then
+        APIAccess="Failure"
+        APIResult="Failure"
+        error "Unable to obtain a Jamf API token (HTTP ${JAMF_HTTP_STATUS}, curl ${JAMF_HTTP_CURL_EXIT})."
+        return 1
+    fi
+    tokenResponse="${JAMF_HTTP_BODY}"
 
-    if [[ "${osMajorVersion}" -lt 12 ]]; then
-        apiBearerToken=$(/usr/bin/awk -F \" 'NR==2{print $4}' <<< "$tokenResponse" | /usr/bin/xargs)
-    else
-        apiBearerToken=$(echo "$tokenResponse" | plutil -extract access_token raw -)
+    apiBearerToken="$(get_json_path "${tokenResponse}" "access_token" 2>/dev/null || true)"
+    if [[ -z "${apiBearerToken}" ]]; then
+        APIAccess="Failure"
+        APIResult="Failure"
+        error "Jamf API token response did not contain an access token."
+        return 1
     fi
     check_token "$tokenResponse"
     if [ "$APIResult" = "Failure" ]; then
@@ -255,7 +321,8 @@ function getAccessToken() {
         infoOut "API Bearer Token obtained"
         APIAccess="Success"
         infoOut "API Access result: $APIAccess"
-        token_expires_in=$(echo "$tokenResponse" | plutil -extract expires_in raw -)
+        token_expires_in="$(get_json_path "${tokenResponse}" "expires_in" 2>/dev/null || print 0)"
+        [[ "${token_expires_in}" == <1-> ]] || token_expires_in=1200
         current_epoch=$(date +%s)
         token_expiration_epoch=$((current_epoch + token_expires_in - 1))
     else
@@ -316,8 +383,10 @@ function jmfrdeploy() {
         updateDialog "listitem: delete, title: ReEnroll in progress …,"
         infoOut "API credentials set, continuing"
         updateDialog "progresstext: API credentials set, continuing"
-        apiResponse
-        computerIDLookup
+        if ! apiResponse || ! computerIDLookup; then
+            updateDialog "progresstext: Unable to gather Jamf inventory"
+            return 1
+        fi
         updateDialog "progresstext: Checking computer inventory"
         computerInventoryInfo
         updateDialog "progresstext: Clearing failed MDM commands"
@@ -352,7 +421,11 @@ function jssConnectionStatus() {
     scriptResult+="Check for Jamf Pro server connection; "
 
     unset jssStatus
-    jssStatus=$(/usr/local/bin/jamf checkJSSConnection 2>&1 | /usr/bin/tr -d '\n')
+    if [[ -z "${jamfBinary}" || ! -x "${jamfBinary}" ]]; then
+        jssAvailable="not installed"
+        return 0
+    fi
+    jssStatus=$("${jamfBinary}" checkJSSConnection 2>&1 | /usr/bin/tr -d '\n')
 
     case "${jssStatus}" in
         *"The JSS is available." ) jssAvailable="yes" ;;

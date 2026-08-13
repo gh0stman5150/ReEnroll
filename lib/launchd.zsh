@@ -7,6 +7,14 @@ function reconLaunchDaemon() {
         return 0
     fi
 
+    if [[ -z "${jamfBinary:-}" || ! -x "${jamfBinary}" ]]; then
+        jamfBinary="$(findJamfBinary || true)"
+    fi
+    if [[ -z "${jamfBinary}" ]]; then
+        errorOut "Unable to create the recon LaunchDaemon because the Jamf binary is unavailable"
+        return 1
+    fi
+
     if [[ "$debugMode" = "verbose" ]]; then
         debugVerbose "Creating organization folder if necessary to house the jamf-recon.zsh script"
         debugVerbose "Creating jamf-recon.zsh script"
@@ -30,6 +38,7 @@ function reconLaunchDaemon() {
     else
         rotatePasswordCommand='echo "$(date +"%Y-%m-%d %H:%M:%S") - [RECON DAEMON] Management Account Password will not be rotated" >> "'"$scriptLog"'"'
     fi
+    rotatePasswordCommand="${rotatePasswordCommand//\/usr\/local\/bin\/jamf/${jamfBinary}}"
 
     tee "/Library/$organizationName/jamf-recon.zsh" << EOF
 #!/bin/zsh
@@ -43,7 +52,7 @@ log_message() {
 log_message "=== Recon LaunchDaemon Started ==="
 
 log_message "Running Jamf recon for user: $networkUser"
-/usr/local/bin/jamf recon -endUsername "$networkUser" >> "\$RECON_LOG" 2>&1
+"${jamfBinary}" recon -endUsername "$networkUser" >> "\$RECON_LOG" 2>&1
 reconStatus=\$?
 if [ \$reconStatus -eq 0 ]; then
     log_message "Jamf recon completed successfully"
@@ -52,7 +61,7 @@ else
 fi
 
 log_message "Running Jamf policy"
-/usr/local/bin/jamf policy >> "\$RECON_LOG" 2>&1
+"${jamfBinary}" policy >> "\$RECON_LOG" 2>&1
 policyStatus=\$?
 if [ \$policyStatus -eq 0 ]; then
     log_message "Jamf policy completed successfully"
@@ -63,9 +72,9 @@ fi
 $rotatePasswordCommand
 
 log_message "Checking admin status for user: $loggedInUser"
-if dseditgroup -o checkmember -m $loggedInUser admin | grep -q "is a member"; then
+if /usr/sbin/dseditgroup -o checkmember -m "$loggedInUser" admin | /usr/bin/grep -q "is a member"; then
     log_message "$loggedInUser is an admin. Removing from the admin group..."
-    /usr/bin/sudo dseditgroup -o edit -d $loggedInUser -t user admin
+    /usr/sbin/dseditgroup -o edit -d "$loggedInUser" -t user admin
     if [ \$? -eq 0 ]; then
         log_message "$loggedInUser has been removed from the admin group"
     else
@@ -105,7 +114,7 @@ EOF
 <array>
 <string>/bin/zsh</string>
 <string>-c</string>
-<string>"/Library/$organizationName/jamf-recon.zsh"</string>
+<string>/Library/$organizationName/jamf-recon.zsh</string>
 </array>
 <key>RunAtLoad</key>
 <true/>
@@ -120,5 +129,6 @@ EOF
 EOF
 
     /usr/sbin/chown root:wheel /Library/LaunchDaemons/$organizationReverseDomain.jamf-recon.plist && /bin/chmod 644 /Library/LaunchDaemons/$organizationReverseDomain.jamf-recon.plist
-    /bin/launchctl bootstrap system /Library/LaunchDaemons/$organizationReverseDomain.jamf-recon.plist && /bin/launchctl start /Library/LaunchDaemons/$organizationReverseDomain.jamf-recon.plist
+    /bin/launchctl bootstrap system "/Library/LaunchDaemons/$organizationReverseDomain.jamf-recon.plist" && \
+        /bin/launchctl kickstart -k "system/$organizationReverseDomain.jamf-recon"
 }

@@ -46,14 +46,14 @@ function validate_password() {
 
     checkTokenExpiration
 
-    lapsPasswordInformation=$(curl -X 'GET' \
-        "${jssurl}"api/v2/local-admin-password/"${management_id}"/account/"${lapsAdminAccount}"/password \
-        -H 'accept: application/json' \
-        -H "Authorization: Bearer ${apiBearerToken}"
-        )
-    check_status "$lapsPasswordInformation"
+    jamfApiRequest GET "${jssurl}api/v2/local-admin-password/${management_id}/account/${lapsAdminAccount}/password" \
+        --header 'Accept: application/json' \
+        --header "Authorization: Bearer ${apiBearerToken}" || true
+    lapsPasswordInformation="${JAMF_HTTP_BODY}"
+    check_status "${JAMF_HTTP_STATUS}"
     if [ "$APIResult" = "Failure" ]; then
-        errorOut "Failed to gather LAPS Password, error: $APIResult"
+        error "Failed to gather the LAPS password (HTTP ${JAMF_HTTP_STATUS})."
+        return 1
     else
         infoOut "Successfully gathered LAPS Password, result: $APIResult"
     fi
@@ -102,26 +102,26 @@ function updateLAPSPassword() {
     randomPassword=$(openssl rand -base64 29 | tr -d '=' | cut -c 1-30)
 
     checkTokenExpiration
-    apiResponse
-    computerIDLookup
+    apiResponse || return 1
+    computerIDLookup || return 1
 
-    setLAPSPassword=$(/usr/bin/curl -X 'PUT' \
-        --url "${jssurl}api/v2/local-admin-password/$management_id/set-password" \
-        -H 'accept: application/json' \
-        -H "Authorization: Bearer $apiBearerToken" \
-        -H 'Content-Type: application/json' \
-        -d "{
+    jamfApiRequest PUT "${jssurl}api/v2/local-admin-password/${management_id}/set-password" \
+        --header 'Accept: application/json' \
+        --header "Authorization: Bearer ${apiBearerToken}" \
+        --header 'Content-Type: application/json' \
+        --data "{
     \"lapsUserPasswordList\": [
         {
         \"username\": \"$lapsAdminAccount\",
         \"password\": \"$randomPassword\"
         }
     ]
-    }"
-    )
-    check_status "$setLAPSPassword"
+    }" || true
+    setLAPSPassword="${JAMF_HTTP_BODY}"
+    check_status "${JAMF_HTTP_STATUS}"
     if [ "$APIResult" = "Failure" ]; then
-        errorOut "Failed to set LAPS Password, error: $APIResult"
+        error "Failed to set the LAPS password (HTTP ${JAMF_HTTP_STATUS})."
+        return 1
     else
         infoOut "Successfully set LAPS Password, result: $APIResult"
     fi
@@ -143,7 +143,11 @@ function rotateLAPSPassword() {
     sleep 10
 
     infoOut "Sending Rotate Management Account Password Command "
-    /usr/local/bin/jamf rotateManagementAccountPassword
+    if [[ -z "${jamfBinary}" || ! -x "${jamfBinary}" ]]; then
+        error "The Jamf binary is unavailable; the management account password cannot be rotated locally."
+        return 1
+    fi
+    "${jamfBinary}" rotateManagementAccountPassword
 
     verifyLAPSCredentials
 }

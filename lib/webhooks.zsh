@@ -21,7 +21,9 @@ function webHookMessage() {
         fi
 
         infoOut "Sending Slack WebHook"
-        curl -s -X POST -H 'Content-type: application/json' \
+        if ! /usr/bin/curl --silent --show-error --fail \
+            --connect-timeout 10 --max-time 30 \
+            --request POST --header 'Content-type: application/json' \
             -d \
             '{
     "blocks": [
@@ -82,7 +84,9 @@ function webHookMessage() {
         }
     ]
 }' \
-            "$slackURL"
+            "$slackURL"; then
+            warning "Slack webhook delivery failed."
+        fi
     fi
 
     if [[ -z "$teamsURL" ]]; then
@@ -139,6 +143,11 @@ function webHookMessage() {
     }]
 }'
 
-        curl -s -X POST -H "Content-Type: application/json" -d "$jsonPayload" "$teamsURL"
+        if ! /usr/bin/curl --silent --show-error --fail \
+            --connect-timeout 10 --max-time 30 \
+            --request POST --header "Content-Type: application/json" \
+            --data "$jsonPayload" "$teamsURL"; then
+            warning "Teams webhook delivery failed."
+        fi
     fi
 }

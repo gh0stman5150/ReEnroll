@@ -1,5 +1,7 @@
 #!/bin/zsh --no-rcs
 
+umask 077
+
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 # Script Information
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
@@ -25,8 +27,19 @@ scriptDirectory="$(cd -- "$(dirname -- "$0")" && pwd -P)"
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
 # API information (ReEnroll API Credentials)
-client_id="$4"
-client_secret="$5"
+# Jamf script parameters are ordinary process arguments and are not an
+# appropriate default transport for secrets. Credentials are loaded from the
+# System keychain later, after logging is available. Parameter credentials can
+# be enabled temporarily for legacy policies with
+# REENROLL_ALLOW_PARAMETER_CREDENTIALS=true.
+parameter_client_id="${4:-}"
+parameter_client_secret="${5:-}"
+client_id=""
+client_secret=""
+reenrollCredentialService="${REENROLL_CREDENTIAL_SERVICE:-ReEnroll}"
+reenrollCredentialReader="${REENROLL_CREDENTIAL_READER:-${9:-}}"
+reenrollAllowSecurityCliCredentialReader="${REENROLL_ALLOW_SECURITY_CLI_CREDENTIAL_READER:-false}"
+reenrollAllowParameterCredentials="${REENROLL_ALLOW_PARAMETER_CREDENTIALS:-false}"
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 # Skip Check-In, LAPS Admin Account Username and User to Exempt/Target for Deletion Options
@@ -37,7 +50,7 @@ skipCheckIN="false"                                                 # [ false (d
 # Skip LAPS admin account verification after enrollment
 skipLAPSAdminCheck="false"                                          # [ false (default) | true ]
 # LAPS admin account username (add the Jamf managed local admin account username here)
-lapsAdminAccount="$6"                                                 # [ add the LAPS admin account username here ]
+lapsAdminAccount="${6:-}"                                             # [ add the LAPS admin account username here ]
 # Skip User Exemption/Targeted Deletion
 skipAccountDeletion="false"                                         # [ false (default) | true ]
 # Define the exempt user list from being deleted (Add the username in quotes, with a space in between each)
@@ -45,7 +58,7 @@ exempt_users=("Shared" "Guest" "$loggedInUser")                     # [ add the 
 # Define the targeted user list to be deleted (Add the username in quotes, with a space in between each) 
 targeted_users=("$lapsAdminAccount" "anotherAccount" )              # [ add the targeted user list here ]
 # Jamf Enrollment Invitation ID (https:/company.jamfcloud.com/enroll?invitation=1542270881__;!!KwNVnq) (Invitation ID in this example would be: 1542270881)
-enrollmentInvitation="$7"                                             # [ add the Invitation ID here ]
+enrollmentInvitation="${7:-}"                                        # [ add the Invitation ID here ]
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 # ReEnroll Computers Options
@@ -86,7 +99,7 @@ newComputerSiteID=""                                         # Move Computer Sit
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
 # Display a ReEnroll progress dialog
-displayReEnrollDialog="$8"                                    # Display ReEnroll Dialog [ true | false (default) ]
+displayReEnrollDialog="${8:-false}"                           # Display ReEnroll Dialog [ true | false (default) ]
 # Unattended Exit Options
 unattendedExit="true"                                         # Unattended Exit [ true | false (default) ]
 # Unattended Exit Seconds
@@ -103,6 +116,8 @@ fi
 timestamp=$(date +"%Y-%m-%d %I:%M:%S %p %Z")
 # Dialog Binary
 dialogBinary="/usr/local/bin/dialog"
+dialogPid=""
+caffeinatePid=""
 # Dialog temporary command files
 dialogLog=$(mktemp /var/tmp/dialogLog.XXXXXX)
 updateDialogLog=$(mktemp /var/tmp/updateDialogLog.XXXXXX)
@@ -117,6 +132,7 @@ fi
 ### Overlay Icon ###
 useOverlayIcon="true"								# Toggles swiftDialog to use an overlay icon [ true (default) | false ]
 overlayicon=""
+errorCount=0
 
 ### Webhook Options ###
 
@@ -130,6 +146,9 @@ slackURL=""                                                                     
 
 # Current JSS address
 jssurl=$(/usr/bin/defaults read /Library/Preferences/com.jamfsoftware.jamf.plist jss_url)
+jssurl="${jssurl%/}/"
+jamfBinary=""
+jamfInventoryApiVersion="v3"
 # Jamf Pro URL for on-prem, multi-node, clustered environments (Used for webhook url button)
 case ${jssurl} in
     *"test"*    ) jamfProURL="https://test.jamfcloud.com" ;;
@@ -221,7 +240,6 @@ function error() {
 
 function warning() {
     updateScriptLog "[WARNING]         ${1}"
-    (( errorCount++ )) || true
 }
 
 function fatal() {
@@ -252,6 +270,103 @@ function sourceModule() {
     fi
 
     source "${modulePath}"
+}
+
+function findJamfBinary() {
+    local candidate
+
+    for candidate in /usr/local/bin/jamf /usr/local/jamf/bin/jamf; do
+        if [[ -x "${candidate}" ]]; then
+            print -r -- "${candidate}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+function readReEnrollSecret() {
+    local account="$1"
+    local readerOwner=""
+    local readerMode=""
+
+    if [[ -n "${reenrollCredentialReader}" ]]; then
+        if [[ "${reenrollCredentialReader}" != /* || ! -x "${reenrollCredentialReader}" ]]; then
+            warning "Configured ReEnroll credential reader is not an executable absolute path."
+            return 1
+        fi
+        readerOwner=$(/usr/bin/stat -f '%Su' "${reenrollCredentialReader}" 2>/dev/null || true)
+        readerMode=$(/usr/bin/stat -f '%OLp' "${reenrollCredentialReader}" 2>/dev/null || true)
+        if [[ "${readerOwner}" != "root" || "${readerMode}" != <-> ]]; then
+            warning "ReEnroll credential reader must be root-owned and not group/world writable."
+            return 1
+        fi
+        if (( (8#${readerMode} & 8#22) != 0 )); then
+            warning "ReEnroll credential reader must be root-owned and not group/world writable."
+            return 1
+        fi
+        if ! /usr/bin/codesign --verify --strict "${reenrollCredentialReader}" >/dev/null 2>&1; then
+            warning "ReEnroll credential reader does not have a valid code signature."
+            return 1
+        fi
+        "${reenrollCredentialReader}" "${account}" "${reenrollCredentialService}" 2>/dev/null
+        return
+    fi
+
+    case "${reenrollAllowSecurityCliCredentialReader:l}" in
+        true|1|yes)
+            /usr/bin/security find-generic-password -a "${account}" -s "${reenrollCredentialService}" -w \
+                /Library/Keychains/System.keychain 2>/dev/null
+            return
+            ;;
+    esac
+
+    return 1
+}
+
+function loadApiCredentials() {
+    local keychainClientID=""
+    local keychainClientSecret=""
+
+    keychainClientID="$(readReEnrollSecret JamfApiClientID || true)"
+    keychainClientSecret="$(readReEnrollSecret JamfApiClientSecret || true)"
+
+    if [[ -n "${keychainClientID}" && -n "${keychainClientSecret}" ]]; then
+        client_id="${keychainClientID}"
+        client_secret="${keychainClientSecret}"
+        infoOut "Loaded Jamf API client credentials from the System keychain."
+        return 0
+    fi
+
+    case "${reenrollAllowParameterCredentials:l}" in
+        true|1|yes)
+            if [[ -n "${parameter_client_id}" && -n "${parameter_client_secret}" ]]; then
+                client_id="${parameter_client_id}"
+                client_secret="${parameter_client_secret}"
+                warning "Using legacy Jamf script-parameter credentials. Migrate these secrets to the System keychain."
+                return 0
+            fi
+            ;;
+    esac
+
+    if [[ -n "${parameter_client_id}" || -n "${parameter_client_secret}" ]]; then
+        warning "Ignoring Jamf API credentials supplied in script parameters because REENROLL_ALLOW_PARAMETER_CREDENTIALS is not enabled."
+    fi
+    return 1
+}
+
+function prepareJamfEnvironment() {
+    if [[ "${jssurl}" != https://* ]]; then
+        fatal "Jamf Pro URL is missing or is not HTTPS. Verify com.jamfsoftware.jamf.plist."
+    fi
+
+    jamfBinary="$(findJamfBinary || true)"
+    if [[ -n "${jamfBinary}" ]]; then
+        infoOut "Detected Jamf binary: ${jamfBinary}"
+    else
+        warning "The local Jamf binary is not currently installed; API redeployment or enrollment renewal will be required."
+    fi
+
+    loadApiCredentials || notice "No usable Jamf API client credentials were found."
 }
 
 sourceModule "dialog.zsh"
@@ -576,7 +691,8 @@ function startRuntimeSession() {
         dryRunOut "Would caffeinate this script for the duration of the run"
     else
         infoOut "Caffeinating this script (PID: $reEnrollPID)"
-        caffeinate -dimsu -w $reEnrollPID &
+        caffeinate -dimsu -w "$reEnrollPID" &
+        caffeinatePid=$!
     fi
 }
 
@@ -592,10 +708,12 @@ message=""
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
 function caffeinateExit() {
-
-    infoOut "De-caffeinate $reEnrollPID..."
-    killProcess "caffeinate"
-
+    if [[ -n "${caffeinatePid}" ]] && kill -0 "${caffeinatePid}" 2>/dev/null; then
+        infoOut "Stopping tracked caffeinate process ${caffeinatePid}..."
+        kill "${caffeinatePid}" 2>/dev/null || true
+        wait "${caffeinatePid}" 2>/dev/null || true
+    fi
+    caffeinatePid=""
 }
 
 function invalidateToken() {
@@ -610,18 +728,18 @@ function invalidateToken() {
         return
     fi
 
-    responseCode=$(/usr/bin/curl -w "%{http_code}" -H "Authorization: Bearer ${apiBearerToken}" "${jssurl}api/v1/auth/invalidate-token" -X POST -s -o /dev/null)
-    if [[ ${responseCode} == 204 ]]; then
+    jamfApiRequest POST "${jssurl}api/v1/auth/invalidate-token" \
+        --header "Authorization: Bearer ${apiBearerToken}" || true
+    if [[ ${JAMF_HTTP_STATUS} == 204 ]]; then
         quitOut "Token successfully invalidated"
-        access_token=""
+        apiBearerToken=""
         token_expiration_epoch="0"
-    elif [[ ${responseCode} == 401 ]]; then
+    elif [[ ${JAMF_HTTP_STATUS} == 401 ]]; then
         quitOut "Token already invalid"
     else
-        quitOut "An unknown error occurred invalidating the token"
-        apiBearerToken=$(/usr/bin/curl "${jssurl}api/v1/auth/invalidate-token" --silent --header "Authorization: Bearer ${apiBearerToken}" -X POST)
-        apiBearerToken=""
+        quitOut "Unable to invalidate the token (HTTP ${JAMF_HTTP_STATUS}); clearing the local copy"
     fi
+    apiBearerToken=""
 }
 
 function rm_if_exists() {
@@ -699,7 +817,15 @@ function handleTerminationSignal() {
 
 # Quit Script function
 function quitScript() {
-    local exitCode="${1:-0}"
+    local exitCode="${1:-}"
+
+    if [[ -z "${exitCode}" ]]; then
+        if (( errorCount > 0 )); then
+            exitCode=1
+        else
+            exitCode=0
+        fi
+    fi
 
 # WebHook Message
 case ${webhookEnabled} in
@@ -809,6 +935,7 @@ function prepareStartup() {
     prepareOverlayIcon
     prepareLogTracking
     runInitialChecks
+    prepareJamfEnvironment
     prepareUserContext
     prepareDialogEnvironment
     buildReEnrollDialog
@@ -1031,12 +1158,12 @@ function main() {
 
     if [ -z "$client_id" ] || [ -z "$client_secret" ] || [ "$APIAccess" = "Failure" ]; then
         notice "Client ID and Client Secret not set, skipping computer site update"
-        quitScript "0"
+        quitScript
     else
         updatedComputerInventoryInfo
     fi
 
-    quitScript "1"
+    quitScript
 }
 
 trap 'cleanupResources' EXIT

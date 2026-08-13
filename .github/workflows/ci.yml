@@ -12,8 +12,13 @@ permissions:
 jobs:
   zsh-ci:
     runs-on: macos-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install workflow tooling
+        run: brew install actionlint
+      - name: Validate workflow
+        run: actionlint .github/workflows/ci.yml
       - name: Run syntax and module checks
         run: zsh scripts/check.sh

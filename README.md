@@ -26,6 +26,29 @@ ReEnroll is designed to automate the re-enrollment process of devices into Jamf 
 
 ### Prerequisites
 
+ReEnroll supports macOS 12 and later. Jamf API client credentials require Jamf Pro 10.49 or later. The inventory client tries the current `v3` API first and falls back to `v2` or deprecated `v1` only for older on-premises compatibility.
+
+### Jamf Pro deployment
+
+Do not upload `ReEnroll.sh` by itself: the source tree is modular. Generate the standalone Jamf Script object payload with:
+
+```bash
+python3 scripts/build_jamf_artifact.py
+```
+
+Upload `dist/ReEnroll-jamf.zsh` to Jamf Pro. Jamf custom parameters are:
+
+- `$4`: legacy API client ID; ignored unless `REENROLL_ALLOW_PARAMETER_CREDENTIALS=true`.
+- `$5`: legacy API client secret; ignored unless that same temporary compatibility switch is enabled.
+- `$6`: Jamf-managed LAPS administrator username.
+- `$7`: enrollment invitation ID.
+- `$8`: display the swiftDialog progress UI (`true` or `false`, default `false`).
+- `$9`: optional absolute path to the dedicated signed API credential reader.
+
+Ordinary Jamf script parameters expose secrets as process arguments. The supported default is a System-keychain pair with service `ReEnroll` and accounts `JamfApiClientID` and `JamfApiClientSecret`, read through `REENROLL_CREDENTIAL_READER`. The reader must be an absolute-path, root-owned, signed executable that is not group/world writable; it receives account and service arguments and prints the secret. Direct use of `/usr/bin/security` requires the explicit legacy switch `REENROLL_ALLOW_SECURITY_CLI_CREDENTIAL_READER=true`. Do not grant a generic `/usr/bin/security` ACL without completing an unprivileged retrieval test on the oldest supported macOS release.
+
+Use Jamf's per-script operating-system requirement to prevent execution below macOS 12. Test both recurring check-in and Self Service policies, including login-window execution and a missing local Jamf binary.
+
 If you are wanting to use the API calls in the script, you will need to setup a ReEnroll API account with the following privileges:
 - Read Computer Inventory Collection
 - Read Computer Check-In 

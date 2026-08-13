@@ -61,7 +61,7 @@ function warning() { :; }
 function updateDialog() { :; }
 function state_set() { STATE[$1]="$2"; }
 function state_get() { print -r -- "${STATE[$1]-}"; }
-function quitScript() { QUIT_CODE="$1"; return 0; }
+function quitScript() { QUIT_CODE="${1:-$(( errorCount > 0 ? 1 : 0 ))}"; return 0; }
 function isDryRun() { return 0; }
 function dryRunOut() { LAST_DRY_RUN="$1"; }
 function curl() { CURL_CALLED=1; return 0; }
@@ -126,6 +126,12 @@ laps_json="$(<"${repo_root}/tests/fixtures/local_admin_password.json")"
 
 assert_eq "$(extract_from_json "${inventory_json}" "managementId")" "mdm-12345" "extract_from_json should parse managementId"
 assert_eq "$(get_json_value "${laps_json}" "password")" "local-password-123" "get_json_value should parse password"
+assert_eq "$(get_json_path "${inventory_json}" "general.managementId")" "mdm-12345" "get_json_path should parse nested values"
+
+check_status "202"
+assert_eq "${APIResult}" "Command Sent" "HTTP 202 should be accepted for Jamf framework redeployment"
+check_status "500"
+assert_eq "${APIResult}" "Failure" "HTTP 500 should be classified as a failure"
 
 jmfrdeploy
 assert_eq "${APIAccess}" "Success" "jmfrdeploy should simulate successful API access in dry run"

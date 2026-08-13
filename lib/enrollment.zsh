@@ -31,7 +31,7 @@ function inventoryError() {
         webhookStatus="ReEnroll with notification"
         reEnrollMethod="Notification for Renewing Enrollment (Dry Run)"
         dryRunOut "Would present the renew profiles flow and send enrollment renewal instructions"
-        quitScript "0"
+        quitScript
         return 0
     fi
 
@@ -82,7 +82,7 @@ function inventoryError() {
                     updateDialog "listitem: title: Jamf Update Needed, icon: SF=arrow.clockwise.icloud.fill,weight=bold, statustext: Update Command Sent, status: nothing"
                     sleep 30
                 fi
-                quitScript "0"
+                quitScript
                 ;;
             3)
                 notice "${loggedInUser} clicked Not Now;"
@@ -92,7 +92,7 @@ function inventoryError() {
                 webhookStatus="ReEnroll with notification"
                 reEnrollMethod="Customer Chose: Not Now"
                 state_set "DeviceEnrolledStatus" "Not Enrolled"
-                quitScript "0"
+                quitScript
                 ;;
             4)
                 notice "${loggedInUser} allowed timer to expire;"
@@ -102,7 +102,7 @@ function inventoryError() {
                 webhookStatus="ReEnroll with notification"
                 reEnrollMethod="Customer allowed timer to expire"
                 state_set "DeviceEnrolledStatus" "Not Enrolled"
-                quitScript "0"
+                quitScript
                 ;;
             20)
                 notice "${loggedInUser} had Do Not Disturb enabled"
@@ -112,7 +112,7 @@ function inventoryError() {
                 webhookStatus="ReEnroll with notification"
                 reEnrollMethod="Customer had Do Not Disturb enabled"
                 state_set "DeviceEnrolledStatus" "Not Enrolled"
-                quitScript "0"
+                quitScript
                 ;;
             *)
                 notice "Something else happened; Exit code: ${returncode};"
@@ -171,7 +171,11 @@ function reEnrollInvitation() {
         fi
 
         infoOut "Sending Silent Enrollment Invitation"
-        /usr/local/bin/jamf enroll -invitation "$enrollmentInvitation" -noRecon -noPolicy
+        if [[ -z "${jamfBinary}" || ! -x "${jamfBinary}" ]]; then
+            error "The Jamf binary is unavailable; the enrollment invitation cannot be sent locally."
+            return 1
+        fi
+        "${jamfBinary}" enroll -invitation "$enrollmentInvitation" -noRecon -noPolicy
         updateDialog "listitem: title: Sending Enrollment Invitation, icon: SF=person.crop.circle.fill.badge.checkmark,weight=bold, statustext: Invitation Sent, status: success"
         updateDialog "progresstext: Enrollment Invitation Sent"
         state_set "ReEnrollMethod" "Enrollment Invitation"
@@ -194,8 +198,6 @@ function checkIn() {
         fi
         return 0
     fi
-
-    errorCount=0
 
     jssConnectionStatus
     if [ "$displayReEnrollDialog" = "true" ]; then
@@ -255,7 +257,12 @@ function checkIn() {
         updateDialog "progresstext: Jamf Pro stores detailed inventory information for each computer."
 
         infoOut "Forcing computer to submit inventory"
-        /usr/local/bin/jamf recon -endUsername "${networkUser}" --verbose >> $tempInventoryLog
+        if [[ -z "${jamfBinary}" || ! -x "${jamfBinary}" ]]; then
+            error "The Jamf binary is unavailable; inventory submission cannot run."
+            inventoryStatus="not installed"
+            return 1
+        fi
+        "${jamfBinary}" recon -endUsername "${networkUser}" --verbose >> "${tempInventoryLog}"
 
         validateInventory
         counterInventory=1
@@ -301,8 +308,7 @@ function computerSiteUpdate() {
     fi
 
     infoOut "Computer has an original Site: ($originalComputerSite), site ID: ($originalComputerSiteID)"
-    /usr/bin/curl --silent --output /dev/null --request PATCH \
-        -sf "${jssurl}api/v1/computers-inventory-detail/$computerID" \
+    if ! jamfApiRequest PATCH "${jssurl}api/${jamfInventoryApiVersion}/computers-inventory-detail/${computerID}" \
         --header "Authorization: Bearer $apiBearerToken" \
         --header 'accept: application/json' \
         --header 'Content-Type: application/json' \
@@ -310,7 +316,10 @@ function computerSiteUpdate() {
         \"general\": {
             \"siteId\": \"$computerSiteID\"
         }
-        }"
+        }"; then
+        error "Unable to restore the original Jamf site (HTTP ${JAMF_HTTP_STATUS})."
+        return 1
+    fi
 }
 
 function newComputerSiteUpdate() {
@@ -320,8 +329,7 @@ function newComputerSiteUpdate() {
     fi
 
     infoOut "Computer has an original Site: ($computerSite)"
-    /usr/bin/curl --silent --output /dev/null --request PATCH \
-        -sf "${jssurl}api/v1/computers-inventory-detail/$computerID" \
+    if ! jamfApiRequest PATCH "${jssurl}api/${jamfInventoryApiVersion}/computers-inventory-detail/${computerID}" \
         --header "Authorization: Bearer $apiBearerToken" \
         --header 'accept: application/json' \
         --header 'Content-Type: application/json' \
@@ -329,7 +337,10 @@ function newComputerSiteUpdate() {
         \"general\": {
             \"siteId\": \"$newComputerSiteID\"
         }
-        }"
+        }"; then
+        error "Unable to update the Jamf site (HTTP ${JAMF_HTTP_STATUS})."
+        return 1
+    fi
 }
 
 function updatedComputerInventoryInfo() {
@@ -342,7 +353,7 @@ function updatedComputerInventoryInfo() {
         else
             computerSiteUpdate
         fi
-        quitScript "0"
+        quitScript
         return 0
     fi
 
@@ -371,5 +382,5 @@ function updatedComputerInventoryInfo() {
         infoOut "Update computer site is set to false, skipping verifying and updating computer Site"
     fi
 
-    quitScript "0"
+    quitScript
 }

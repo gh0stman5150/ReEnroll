@@ -3,8 +3,16 @@ REENROLL_DIALOG_MODULE_LOADED="true"
 
 function prepareOverlayIcon() {
     if [[ "$useOverlayIcon" == "true" ]]; then
-        xxd -p -s 260 "$(defaults read /Library/Preferences/com.jamfsoftware.jamf self_service_app_path)"/Icon$'\r'/..namedfork/rsrc | xxd -r -p > /var/tmp/overlayicon.icns
-        overlayicon="/var/tmp/overlayicon.icns"
+        local selfServicePath
+        selfServicePath=$(defaults read /Library/Preferences/com.jamfsoftware.jamf self_service_app_path 2>/dev/null || true)
+        overlayicon=$(mktemp /var/tmp/reenroll-overlay.XXXXXX) || overlayicon=""
+        if [[ -z "${selfServicePath}" || -z "${overlayicon}" ]] || \
+            ! xxd -p -s 260 "${selfServicePath}"/Icon$'\r'/..namedfork/rsrc 2>/dev/null | \
+                xxd -r -p > "${overlayicon}" || [[ ! -s "${overlayicon}" ]]; then
+            [[ -n "${overlayicon}" ]] && /bin/rm -f -- "${overlayicon}"
+            overlayicon=""
+            warning "Unable to prepare the optional Self Service overlay icon."
+        fi
     else
         overlayicon=""
     fi
@@ -180,24 +188,23 @@ function evalReEnrollDialog() {
 
     notice "Create ReEnroll dialog …"
     "$dialogBinary" "${dialogReEnrollArgs[@]}" &
+    dialogPid=$!
 
     updateDialog "listitem: delete, title: ReEnroll in progress …"
     updateDialog "progresstext: Initializing…"
 }
 
 function killProcess() {
+    local process="${1:-Dialog}"
 
-    process="$1"
-    if process_pid=$(pgrep -a "${process}" 2>/dev/null); then
-        infoOut "Attempting to terminate the '$process' process …"
-        infoOut "(Termination message indicates success.)"
-        kill "$process_pid" 2> /dev/null
-        if pgrep -a "$process" >/dev/null; then
-            errorOut "'$process' could not be terminated."
-        fi
+    if [[ -n "${dialogPid}" ]] && kill -0 "${dialogPid}" 2>/dev/null; then
+        infoOut "Terminating the tracked '${process}' process (PID ${dialogPid}) …"
+        kill "${dialogPid}" 2>/dev/null || true
+        wait "${dialogPid}" 2>/dev/null || true
     else
-        infoOut "The '$process' process isn't running."
+        infoOut "The tracked '${process}' process isn't running."
     fi
+    dialogPid=""
 }
 
 function dialogExit() {
@@ -215,7 +222,7 @@ function completeReEnrollDialog() {
 
     infoOut "Checking if Dialog is running or closed for another prompt"
 
-    if pgrep -x "Dialog" >/dev/null; then
+    if [[ -n "${dialogPid}" ]] && kill -0 "${dialogPid}" 2>/dev/null; then
         infoOut "Dialog is running."
         infoOut "ReEnroll dialog is still running, proceeding"
         updateDialog "ontop: enabled"
@@ -229,6 +236,7 @@ function completeReEnrollDialog() {
     else
         infoOut "Dialog closed at some point. Calling window to show complete"
         "$dialogBinary" "${dialogReEnrollArgs[@]}" &
+        dialogPid=$!
         infoOut "Complete ReEnroll dialog"
         updateDialog "icon: SF=checkmark.circle.fill,weight=bold,colour1=#00ff44,colour2=#075c1e"
         updateDialog "listitem: delete, title: ReEnroll in progress …"
