@@ -11,4 +11,9 @@ done
 
 zsh tests/module_smoke.zsh
 
+if grep -R -n 'eval[[:space:]]' lib ReEnroll.sh; then
+    echo "Unsafe eval invocation found." >&2
+    exit 1
+fi
+
 echo "All checks passed."

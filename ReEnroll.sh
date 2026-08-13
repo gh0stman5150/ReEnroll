@@ -104,8 +104,8 @@ timestamp=$(date +"%Y-%m-%d %I:%M:%S %p %Z")
 # Dialog Binary
 dialogBinary="/usr/local/bin/dialog"
 # Dialog temporary command files
-dialogLog=$( mktemp -u /var/tmp/dialogLog.XXX )
-updateDialogLog=$( mktemp -u /var/tmp/updateDialogLog.XXX )
+dialogLog=$(mktemp /var/tmp/dialogLog.XXXXXX)
+updateDialogLog=$(mktemp /var/tmp/updateDialogLog.XXXXXX)
 
 # Set icon based on whether the Mac is a desktop or laptop
 if system_profiler SPPowerDataType | grep -q "Battery Power"; then

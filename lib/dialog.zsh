@@ -23,6 +23,26 @@ function buildInfoTextScriptVersion() {
     esac
 }
 
+function versionAtLeast() {
+    emulate -L zsh
+    local current="${1%%[^0-9.]*}"
+    local required="${2%%[^0-9.]*}"
+    local -a currentParts requiredParts
+    local index
+
+    currentParts=("${(@s:.:)current}")
+    requiredParts=("${(@s:.:)required}")
+    for index in 1 2 3 4; do
+        if (( ${currentParts[$index]:-0} > ${requiredParts[$index]:-0} )); then
+            return 0
+        fi
+        if (( ${currentParts[$index]:-0} < ${requiredParts[$index]:-0} )); then
+            return 1
+        fi
+    done
+    return 0
+}
+
 function dialogInstall() {
     if isDryRun; then
         dialogVersion="${swiftDialogMinimumRequiredVersion}"
@@ -31,7 +51,17 @@ function dialogInstall() {
     fi
 
     # Get the URL of the latest PKG From the Dialog GitHub repo
-    dialogURL=$(curl -L --silent --fail "https://api.github.com/repos/swiftDialog/swiftDialog/releases/latest" | awk -F '"' "/browser_download_url/ && /pkg\"/ { print \$4; exit }")
+    if ! dialogURL=$(/usr/bin/curl --location --silent --show-error --fail \
+        --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 2 --retry-all-errors \
+        "https://api.github.com/repos/swiftDialog/swiftDialog/releases/latest" |
+        awk -F '"' '/browser_download_url/ && /pkg"/ { print $4; exit }'); then
+        errorOut "Unable to query the swiftDialog release API."
+        return 1
+    fi
+    if [[ -z "$dialogURL" || "$dialogURL" != https://github.com/swiftDialog/swiftDialog/releases/download/*/*.pkg ]]; then
+        errorOut "The swiftDialog release API returned an unexpected package URL."
+        return 1
+    fi
 
     # Expected Team ID of the downloaded PKG
     expectedDialogTeamID="PWA5E9TQ59"
@@ -40,25 +70,37 @@ function dialogInstall() {
 
     # Create temporary working directory
     workDirectory=$(/usr/bin/basename "$0")
-    tempDirectory=$(/usr/bin/mktemp -d "/private/tmp/$workDirectory.XXXXXX")
+    tempDirectory=$(/usr/bin/mktemp -d "/private/tmp/$workDirectory.XXXXXX") || return 1
 
     # Download the installer package
-    /usr/bin/curl --location --silent "$dialogURL" -o "$tempDirectory/Dialog.pkg"
+    if ! /usr/bin/curl --location --silent --show-error --fail \
+        --connect-timeout 10 --max-time 600 --retry 3 --retry-delay 2 --retry-all-errors \
+        "$dialogURL" -o "$tempDirectory/Dialog.pkg"; then
+        errorOut "Unable to download swiftDialog."
+        /bin/rm -Rf -- "$tempDirectory"
+        return 1
+    fi
 
     # Verify the download
     teamID=$(/usr/sbin/spctl -a -vv -t install "$tempDirectory/Dialog.pkg" 2>&1 | awk '/origin=/ {print $NF }' | tr -d '()')
 
     # Install the package if Team ID validates
     if [[ "$expectedDialogTeamID" == "$teamID" ]]; then
-        /usr/sbin/installer -pkg "$tempDirectory/Dialog.pkg" -target /
+        if ! /usr/sbin/installer -pkg "$tempDirectory/Dialog.pkg" -target /; then
+            errorOut "swiftDialog package installation failed."
+            /bin/rm -Rf -- "$tempDirectory"
+            return 1
+        fi
         sleep 2
         dialogVersion=$(/usr/local/bin/dialog --version)
         preFlight "swiftDialog version ${dialogVersion} installed; proceeding..."
     else
-        infoOut "Unable to verify swift dialog team ID. Not installing or udpating"
+        errorOut "Unable to verify the swiftDialog team ID. Not installing or updating."
+        /bin/rm -Rf -- "$tempDirectory"
+        return 1
     fi
 
-    /bin/rm -Rf "$tempDirectory"
+    /bin/rm -Rf -- "$tempDirectory"
 }
 
 function dialogCheck() {
@@ -79,7 +121,7 @@ function dialogCheck() {
         dialogInstall
     else
         dialogVersion=$(/usr/local/bin/dialog --version)
-        if [[ "${dialogVersion}" < "${swiftDialogMinimumRequiredVersion}" ]]; then
+        if ! versionAtLeast "$dialogVersion" "$swiftDialogMinimumRequiredVersion"; then
             preFlight "swiftDialog version ${dialogVersion} found but swiftDialog ${swiftDialogMinimumRequiredVersion} or newer is required; updating..."
             dialogInstall
         else
@@ -102,29 +144,31 @@ function buildReEnrollDialog() {
     inventoryProgressText="Initializing …"
     buildInfoTextScriptVersion
 
-    dialogReEnroll="$dialogBinary \
---title \"$title\" \
---titlefont \"name=Arial, size=25\" \
---icon \"$icon\" \
---message \"\" \
---overlayicon \"$overlayicon\" \
---helpmessage \"$helpMessage\" \
---height 450 \
---width 725 \
---windowbuttons min \
---position center \
---ontop \
---button1text \"Close\" \
---moveable \
---listitem \"ReEnroll in progress …\" \
---progress \
---titlefont size=20 \
---messagefont size=14 \
---infobox \"**Computer Name:**  \n\n • $computerName  \n\n **macOS Version:**  \n\n • $osVersionFull\" \
---progresstext \"$inventoryProgressText\" \
---infotext \"$infoTextScriptVersion\" \
---quitkey K \
---commandfile \"$dialogLog\" "
+    typeset -ga dialogReEnrollArgs
+    dialogReEnrollArgs=(
+        --title "$title"
+        --titlefont "name=Arial, size=25"
+        --icon "$icon"
+        --message ""
+        --overlayicon "$overlayicon"
+        --helpmessage "$helpMessage"
+        --height 450
+        --width 725
+        --windowbuttons min
+        --position center
+        --ontop
+        --button1text "Close"
+        --moveable
+        --listitem "ReEnroll in progress …"
+        --progress
+        --titlefont size=20
+        --messagefont size=14
+        --infobox "**Computer Name:**  \n\n • $computerName  \n\n **macOS Version:**  \n\n • $osVersionFull"
+        --progresstext "$inventoryProgressText"
+        --infotext "$infoTextScriptVersion"
+        --quitkey K
+        --commandfile "$dialogLog"
+    )
 }
 
 function evalReEnrollDialog() {
@@ -135,7 +179,7 @@ function evalReEnrollDialog() {
     fi
 
     notice "Create ReEnroll dialog …"
-    eval "$dialogReEnroll" &
+    "$dialogBinary" "${dialogReEnrollArgs[@]}" &
 
     updateDialog "listitem: delete, title: ReEnroll in progress …"
     updateDialog "progresstext: Initializing…"
@@ -184,7 +228,7 @@ function completeReEnrollDialog() {
         sleep 10
     else
         infoOut "Dialog closed at some point. Calling window to show complete"
-        eval "$dialogReEnroll" &
+        "$dialogBinary" "${dialogReEnrollArgs[@]}" &
         infoOut "Complete ReEnroll dialog"
         updateDialog "icon: SF=checkmark.circle.fill,weight=bold,colour1=#00ff44,colour2=#075c1e"
         updateDialog "listitem: delete, title: ReEnroll in progress …"
@@ -203,26 +247,27 @@ function jamfProfileRenew() {
         return 0
     fi
 
-    dialogUpdateReEnroll="$dialogBinary \
-    --title \"Jamf Update Needed\" \
-    --titlefont \"name=Arial, size=25\" \
-    --icon \"$icon\" \
-    --iconsize 90 \
-    --overlayicon \"$overlayicon\" \
-    --message \"Hello! Jamf, your Apple management software, needs to be updated. \n\nPlease choose **Options** and **Update** from the drop down menu, or double-click on the **Device Enrollment** notice located in your notifications center.\" \
-    --messagefont \"name=Arial,size=15\" \
-    --position bottomright \
-    --height 355 \
-    --width 530 \
-    --button1text \"Update Now\" \
-    --infobuttontext \"Not Now\" \
-    --helpmessage \"$helpMessage\" \
-    --timer 600 \
-    --hidetimerbar \
-    --ontop \
-    --moveable \
-    --messagealignment left \
-    --commandfile \"$updateDialogLog\" "
+    local -a dialogUpdateArgs=(
+        --title "Jamf Update Needed"
+        --titlefont "name=Arial, size=25"
+        --icon "$icon"
+        --iconsize 90
+        --overlayicon "$overlayicon"
+        --message "Hello! Jamf, your Apple management software, needs to be updated. \n\nPlease choose **Options** and **Update** from the drop down menu, or double-click on the **Device Enrollment** notice located in your notifications center."
+        --messagefont "name=Arial,size=15"
+        --position bottomright
+        --height 355
+        --width 530
+        --button1text "Update Now"
+        --infobuttontext "Not Now"
+        --helpmessage "$helpMessage"
+        --timer 600
+        --hidetimerbar
+        --ontop
+        --moveable
+        --messagealignment left
+        --commandfile "$updateDialogLog"
+    )
 
-    eval "$dialogUpdateReEnroll"
+    "$dialogBinary" "${dialogUpdateArgs[@]}"
 }

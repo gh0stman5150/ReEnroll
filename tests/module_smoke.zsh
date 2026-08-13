@@ -90,12 +90,36 @@ function assert_contains() {
     fi
 }
 
+function assert_true() {
+    local message="$1"
+    shift
+    if ! "$@"; then
+        print -u2 -- "Assertion failed: ${message}"
+        exit 1
+    fi
+}
+
 source "${repo_root}/lib/dialog.zsh"
 source "${repo_root}/lib/jamf_api.zsh"
 source "${repo_root}/lib/launchd.zsh"
 source "${repo_root}/lib/webhooks.zsh"
 source "${repo_root}/lib/laps.zsh"
 source "${repo_root}/lib/enrollment.zsh"
+
+assert_true "semantic versions should treat 2.10 as newer than 2.5.2" versionAtLeast "2.10.0" "2.5.2"
+if versionAtLeast "2.4.9" "2.5.2"; then
+    print -u2 -- "Assertion failed: older semantic version was accepted"
+    exit 1
+fi
+
+title='ReEnroll; touch /tmp/should-not-run'
+helpMessage='Help $(touch /tmp/should-not-run)'
+icon="SF=test"
+overlayicon=""
+osVersionFull="26.0"
+dialogBinary="/usr/local/bin/dialog"
+buildReEnrollDialog
+assert_eq "${dialogReEnrollArgs[2]}" "$title" "dialog title should remain one literal argument"
 
 inventory_json="$(<"${repo_root}/tests/fixtures/computer_inventory.json")"
 laps_json="$(<"${repo_root}/tests/fixtures/local_admin_password.json")"
