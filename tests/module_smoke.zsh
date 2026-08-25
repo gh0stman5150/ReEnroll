@@ -133,6 +133,25 @@ assert_eq "${APIResult}" "Command Sent" "HTTP 202 should be accepted for Jamf fr
 check_status "500"
 assert_eq "${APIResult}" "Failure" "HTTP 500 should be classified as a failure"
 
+typeset -ga RUN_AS_USER_ARGS=()
+function runAsLoggedInUser() {
+    RUN_AS_USER_ARGS=("$@")
+    return 0
+}
+function triggerEnrollment() { return 0; }
+function isDryRun() { return 1; }
+
+displayReEnrollDialog="false"
+osMajorVersion="11"
+serialNumber="TEST-SERIAL"
+QUIT_CODE=""
+inventoryError
+assert_eq "${RUN_AS_USER_ARGS[1]}" "/usr/bin/osascript" "fallback dialog should run in the logged-in user context"
+assert_eq "${RUN_AS_USER_ARGS[2]}" "-e" "fallback dialog should pass an AppleScript expression"
+assert_contains "${RUN_AS_USER_ARGS[3]}" "Jamf Update Needed" "fallback dialog should include the enrollment notice"
+assert_eq "${QUIT_CODE}" "1" "inventory failure should retain its failure exit code"
+function isDryRun() { return 0; }
+
 jmfrdeploy
 assert_eq "${APIAccess}" "Success" "jmfrdeploy should simulate successful API access in dry run"
 assert_eq "${management_id}" "dry-run-management-id" "jmfrdeploy should seed a dry-run management ID"

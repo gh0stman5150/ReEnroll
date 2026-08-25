@@ -56,7 +56,7 @@ function jamfApiRequest() {
     emulate -L zsh
     local method="$1"
     local url="$2"
-    local bodyFile status curlExit
+    local bodyFile httpStatus curlExit
     local -a curlArgs
     shift 2
 
@@ -80,11 +80,11 @@ function jamfApiRequest() {
         curlArgs+=(--retry 3 --retry-delay 2)
     fi
 
-    status=$(/usr/bin/curl "${curlArgs[@]}" "$@" "${url}")
+    httpStatus=$(/usr/bin/curl "${curlArgs[@]}" "$@" "${url}")
     curlExit=$?
     JAMF_HTTP_BODY="$(<"${bodyFile}")"
     /bin/rm -f -- "${bodyFile}"
-    JAMF_HTTP_STATUS="${status:-000}"
+    JAMF_HTTP_STATUS="${httpStatus:-000}"
     JAMF_HTTP_CURL_EXIT="${curlExit}"
 
     (( curlExit == 0 )) || return 1
@@ -121,8 +121,8 @@ function check_token() {
 }
 
 function check_status() {
-    local status="${1:-${JAMF_HTTP_STATUS:-000}}"
-    if [[ "${status}" != <200-299> ]]; then
+    local http_status="${1:-${JAMF_HTTP_STATUS:-000}}"
+    if [[ "${http_status}" != <200-299> ]]; then
         APIResult="Failure"
     else
         APIResult="Command Sent"
@@ -442,9 +442,12 @@ function validatePolicy() {
         return 0
     fi
 
-    marker_file="/var/tmp/jamfTempMarker.txt"
     jamfLogFile="/var/log/jamf.log"
     duplicate_jamfLogFile="$duplicate_log_dir/jamf_position_$timestamp.log"
+
+    if [[ -z "${marker_file}" || ! -f "${marker_file}" ]]; then
+        createMarkerFile
+    fi
 
     if [ -f "$marker_file" ]; then
         lastPosition=$(cat "$marker_file")

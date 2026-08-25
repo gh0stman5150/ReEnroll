@@ -2,6 +2,7 @@
 # GENERATED FILE: run scripts/build_jamf_artifact.py; do not edit directly.
 
 umask 077
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 # Script Information
@@ -261,6 +262,24 @@ function isDryRun() {
 
 function dryRunOut() {
     updateScriptLog "[DRY RUN]         ${1}"
+}
+
+function runAsLoggedInUser() {
+    local userID
+
+    case "${loggedInUser:-}" in
+        ""|root|loginwindow|_mbsetupuser)
+            warning "No valid GUI user is available for user-context command execution."
+            return 1
+            ;;
+    esac
+
+    userID=$(/usr/bin/id -u "${loggedInUser}" 2>/dev/null) || {
+        warning "Unable to resolve the user ID for ${loggedInUser}."
+        return 1
+    }
+
+    /bin/launchctl asuser "${userID}" /usr/bin/sudo -H -u "${loggedInUser}" "$@"
 }
 
 function sourceModule() {
@@ -708,7 +727,7 @@ function jamfApiRequest() {
     emulate -L zsh
     local method="$1"
     local url="$2"
-    local bodyFile status curlExit
+    local bodyFile httpStatus curlExit
     local -a curlArgs
     shift 2
 
@@ -732,11 +751,11 @@ function jamfApiRequest() {
         curlArgs+=(--retry 3 --retry-delay 2)
     fi
 
-    status=$(/usr/bin/curl "${curlArgs[@]}" "$@" "${url}")
+    httpStatus=$(/usr/bin/curl "${curlArgs[@]}" "$@" "${url}")
     curlExit=$?
     JAMF_HTTP_BODY="$(<"${bodyFile}")"
     /bin/rm -f -- "${bodyFile}"
-    JAMF_HTTP_STATUS="${status:-000}"
+    JAMF_HTTP_STATUS="${httpStatus:-000}"
     JAMF_HTTP_CURL_EXIT="${curlExit}"
 
     (( curlExit == 0 )) || return 1
@@ -773,8 +792,8 @@ function check_token() {
 }
 
 function check_status() {
-    local status="${1:-${JAMF_HTTP_STATUS:-000}}"
-    if [[ "${status}" != <200-299> ]]; then
+    local http_status="${1:-${JAMF_HTTP_STATUS:-000}}"
+    if [[ "${http_status}" != <200-299> ]]; then
         APIResult="Failure"
     else
         APIResult="Command Sent"
@@ -1094,9 +1113,12 @@ function validatePolicy() {
         return 0
     fi
 
-    marker_file="/var/tmp/jamfTempMarker.txt"
     jamfLogFile="/var/log/jamf.log"
     duplicate_jamfLogFile="$duplicate_log_dir/jamf_position_$timestamp.log"
+
+    if [[ -z "${marker_file}" || ! -f "${marker_file}" ]]; then
+        createMarkerFile
+    fi
 
     if [ -f "$marker_file" ]; then
         lastPosition=$(cat "$marker_file")
@@ -1214,7 +1236,7 @@ function reconLaunchDaemon() {
     rotatePasswordCommand="${rotatePasswordCommand//\/usr\/local\/bin\/jamf/${jamfBinary}}"
 
     tee "/Library/$organizationName/jamf-recon.zsh" << EOF
-#!/bin/zsh
+#!/bin/zsh --no-rcs
 
 RECON_LOG="$scriptLog"
 
@@ -1827,7 +1849,9 @@ function inventoryError() {
         webhookStatus="ReEnroll with notification (S/N ${serialNumber})"
         reEnrollMethod="Notification for Renewing Enrollment"
         updateProfilesOSA='display dialog "Hello! Jamf, your Apple management software, needs to be updated. \n\nPlease choose Options and Update from the drop down menu, or double-click on the Device Enrollment notice located in your notifications center." with title "Jamf Update Needed" buttons {"Close"} with icon posix file "/Applications/Self-Service Hub.app/Contents/Resources/AppIcon.icns"'
-        /usr/bin/osascript -e "$updateProfilesOSA"
+        if ! runAsLoggedInUser /usr/bin/osascript -e "$updateProfilesOSA"; then
+            warning "Unable to display the enrollment renewal dialog for ${loggedInUser:-the console user}."
+        fi
     fi
 
     error "Jamf Pro Inventory or Policy Connection is NOT available; exiting."
@@ -2179,21 +2203,22 @@ function syncRuntimeUserConfig() {
 jamfLogFile="/var/log/jamf.log"
 duplicate_log_dir=""
 # Marker file for last log position
-marker_file="/var/tmp/jamfTempMarker.txt"
+marker_file=""
 
 # Get the PID of the current script for caffeinate
 reEnrollPID="$$"
 
-# Create a marker file if it doesn't exist
-function createMarkerFile(){
+# Create a private marker file for this run.
+function createMarkerFile() {
+    if [[ -n "${marker_file}" && -f "${marker_file}" ]]; then
+        preFlight "Marker file exists, continuing"
+        return 0
+    fi
 
-# 
-if [ ! -f "$marker_file" ]; then
-        preFlight "Marker file not found, creating temp marker file"
-        touch "$marker_file"
-        else
-        preFlight "marker file exist, continuing"
-     fi
+    marker_file=$(/usr/bin/mktemp /var/tmp/reenroll-jamf-marker.XXXXXX) || \
+        fatal "Unable to create a private Jamf log marker file."
+    /bin/chmod 600 "${marker_file}" || fatal "Unable to secure ${marker_file}."
+    preFlight "Created private marker file: ${marker_file}"
 }
 
 # Create last log position
@@ -2211,13 +2236,9 @@ function createLastLogPosition() {
         preFlight "Duplicate log directory exists, continuing"
      fi
 
-     # Create a directory for duplicate log files if it doesn't exist
-     if [ ! -f "$marker_file" ]; then
-        preFlight "Marker file not found, creating temp marker file"
-        touch "$marker_file"
-        else
-        preFlight "marker file exist, continuing"
-     fi
+      if [[ -z "${marker_file}" || ! -f "${marker_file}" ]]; then
+          createMarkerFile
+      fi
 
     # Specify the duplicate log file with a timestamp
     duplicate_jamfLogFile="$duplicate_log_dir/jamf_position_$timestamp.log"
@@ -2664,7 +2685,7 @@ function addAdmin() {
     if dseditgroup -o checkmember -m "$loggedInUser" admin | grep -q "not a member"; then
         infoOut "${loggedInUser} is not an admin. Adding to the admin group..."
         updateDialog "progresstext: Adding ${loggedInUser} to the admin group..."
-        sudo /usr/sbin/dseditgroup -o edit -a "$loggedInUser" -t user admin
+        /usr/sbin/dseditgroup -o edit -a "$loggedInUser" -t user admin
         infoOut "${loggedInUser} has been added to the admin group."
         updateDialog "progresstext: ${loggedInUser} has been added to the admin group."
     else
@@ -2687,7 +2708,7 @@ function removeAdmin () {
 
     if dseditgroup -o checkmember -m "$loggedInUser" admin | grep -q "is a member"; then
         quitOut "$loggedInUser is an admin. Removing from the admin group..."
-        sudo /usr/sbin/dseditgroup -o edit -d "$loggedInUser" -t user admin
+        /usr/sbin/dseditgroup -o edit -d "$loggedInUser" -t user admin
         quitOut "$loggedInUser has been removed from the admin group."
     else
         quitOut "$loggedInUser is not an admin."
@@ -2728,7 +2749,7 @@ function findUsersandRemove() {
     # Demote LAPS admin account to be removed
     infoOut "Demoting $lapsAdminAccount account"
 
-sudo dseditgroup -o edit -d "$lapsAdminAccount" -t user admin
+/usr/sbin/dseditgroup -o edit -d "$lapsAdminAccount" -t user admin
 
 RESULT=()
 

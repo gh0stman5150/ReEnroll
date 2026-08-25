@@ -41,7 +41,7 @@ function reconLaunchDaemon() {
     rotatePasswordCommand="${rotatePasswordCommand//\/usr\/local\/bin\/jamf/${jamfBinary}}"
 
     tee "/Library/$organizationName/jamf-recon.zsh" << EOF
-#!/bin/zsh
+#!/bin/zsh --no-rcs
 
 RECON_LOG="$scriptLog"
 

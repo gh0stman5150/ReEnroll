@@ -133,7 +133,9 @@ function inventoryError() {
         webhookStatus="ReEnroll with notification (S/N ${serialNumber})"
         reEnrollMethod="Notification for Renewing Enrollment"
         updateProfilesOSA='display dialog "Hello! Jamf, your Apple management software, needs to be updated. \n\nPlease choose Options and Update from the drop down menu, or double-click on the Device Enrollment notice located in your notifications center." with title "Jamf Update Needed" buttons {"Close"} with icon posix file "/Applications/Self-Service Hub.app/Contents/Resources/AppIcon.icns"'
-        /usr/bin/osascript -e "$updateProfilesOSA"
+        if ! runAsLoggedInUser /usr/bin/osascript -e "$updateProfilesOSA"; then
+            warning "Unable to display the enrollment renewal dialog for ${loggedInUser:-the console user}."
+        fi
     fi
 
     error "Jamf Pro Inventory or Policy Connection is NOT available; exiting."

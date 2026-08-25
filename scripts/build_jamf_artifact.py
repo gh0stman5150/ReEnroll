@@ -42,7 +42,8 @@ def build() -> str:
 
 def main() -> None:
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-    OUTPUT.write_text(build(), encoding="utf-8", newline="\n")
+    with OUTPUT.open("w", encoding="utf-8", newline="\n") as output_file:
+        output_file.write(build())
     print(OUTPUT.relative_to(ROOT))
 
 

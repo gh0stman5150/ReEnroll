@@ -1,6 +1,7 @@
 #!/bin/zsh --no-rcs
 
 umask 077
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 # Script Information
@@ -262,6 +263,24 @@ function dryRunOut() {
     updateScriptLog "[DRY RUN]         ${1}"
 }
 
+function runAsLoggedInUser() {
+    local userID
+
+    case "${loggedInUser:-}" in
+        ""|root|loginwindow|_mbsetupuser)
+            warning "No valid GUI user is available for user-context command execution."
+            return 1
+            ;;
+    esac
+
+    userID=$(/usr/bin/id -u "${loggedInUser}" 2>/dev/null) || {
+        warning "Unable to resolve the user ID for ${loggedInUser}."
+        return 1
+    }
+
+    /bin/launchctl asuser "${userID}" /usr/bin/sudo -H -u "${loggedInUser}" "$@"
+}
+
 function sourceModule() {
     local modulePath="${scriptDirectory}/lib/${1}"
     if [[ ! -r "${modulePath}" ]]; then
@@ -475,21 +494,22 @@ function syncRuntimeUserConfig() {
 jamfLogFile="/var/log/jamf.log"
 duplicate_log_dir=""
 # Marker file for last log position
-marker_file="/var/tmp/jamfTempMarker.txt"
+marker_file=""
 
 # Get the PID of the current script for caffeinate
 reEnrollPID="$$"
 
-# Create a marker file if it doesn't exist
-function createMarkerFile(){
+# Create a private marker file for this run.
+function createMarkerFile() {
+    if [[ -n "${marker_file}" && -f "${marker_file}" ]]; then
+        preFlight "Marker file exists, continuing"
+        return 0
+    fi
 
-# 
-if [ ! -f "$marker_file" ]; then
-        preFlight "Marker file not found, creating temp marker file"
-        touch "$marker_file"
-        else
-        preFlight "marker file exist, continuing"
-     fi
+    marker_file=$(/usr/bin/mktemp /var/tmp/reenroll-jamf-marker.XXXXXX) || \
+        fatal "Unable to create a private Jamf log marker file."
+    /bin/chmod 600 "${marker_file}" || fatal "Unable to secure ${marker_file}."
+    preFlight "Created private marker file: ${marker_file}"
 }
 
 # Create last log position
@@ -507,13 +527,9 @@ function createLastLogPosition() {
         preFlight "Duplicate log directory exists, continuing"
      fi
 
-     # Create a directory for duplicate log files if it doesn't exist
-     if [ ! -f "$marker_file" ]; then
-        preFlight "Marker file not found, creating temp marker file"
-        touch "$marker_file"
-        else
-        preFlight "marker file exist, continuing"
-     fi
+      if [[ -z "${marker_file}" || ! -f "${marker_file}" ]]; then
+          createMarkerFile
+      fi
 
     # Specify the duplicate log file with a timestamp
     duplicate_jamfLogFile="$duplicate_log_dir/jamf_position_$timestamp.log"
@@ -960,7 +976,7 @@ function addAdmin() {
     if dseditgroup -o checkmember -m "$loggedInUser" admin | grep -q "not a member"; then
         infoOut "${loggedInUser} is not an admin. Adding to the admin group..."
         updateDialog "progresstext: Adding ${loggedInUser} to the admin group..."
-        sudo /usr/sbin/dseditgroup -o edit -a "$loggedInUser" -t user admin
+        /usr/sbin/dseditgroup -o edit -a "$loggedInUser" -t user admin
         infoOut "${loggedInUser} has been added to the admin group."
         updateDialog "progresstext: ${loggedInUser} has been added to the admin group."
     else
@@ -983,7 +999,7 @@ function removeAdmin () {
 
     if dseditgroup -o checkmember -m "$loggedInUser" admin | grep -q "is a member"; then
         quitOut "$loggedInUser is an admin. Removing from the admin group..."
-        sudo /usr/sbin/dseditgroup -o edit -d "$loggedInUser" -t user admin
+        /usr/sbin/dseditgroup -o edit -d "$loggedInUser" -t user admin
         quitOut "$loggedInUser has been removed from the admin group."
     else
         quitOut "$loggedInUser is not an admin."
@@ -1024,7 +1040,7 @@ function findUsersandRemove() {
     # Demote LAPS admin account to be removed
     infoOut "Demoting $lapsAdminAccount account"
 
-sudo dseditgroup -o edit -d "$lapsAdminAccount" -t user admin
+/usr/sbin/dseditgroup -o edit -d "$lapsAdminAccount" -t user admin
 
 RESULT=()
 
