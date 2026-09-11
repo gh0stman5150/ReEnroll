@@ -72,6 +72,23 @@ Use Jamf's per-script operating-system requirement to prevent execution below
 macOS 12. Test recurring check-in and Self Service policies, including
 login-window execution and a missing local Jamf binary.
 
+## Source configuration and testing
+
+Before building, review the configuration section in `ReEnroll.sh`, including
+`targeted_users`, `exempt_users`, account-cleanup and enrollment switches,
+organization identifiers, site assignment and support-contact placeholders.
+These are source settings, not extra Jamf parameters. Rebuild after changes.
+Webhooks are disabled by default; do not commit private webhook URLs.
+
+Run `zsh scripts/check.sh`. See [testing and dry-run limits](docs/testing.md)
+for the full checks and endpoint validation. Runtime output is in
+`/Library/Application Support/ReEnroll/ReEnroll.log`.
+
+For failures, verify the uploaded artifact, credential reader, credential pair
+and policy parameters. Use this repository's issue tracker for defects and
+the internal endpoint support process for production incidents. The Slack
+link is a community channel; internal ownership is not specified here.
+
 ## Credentials
 
 Ordinary Jamf script parameters expose secrets as process arguments. The
