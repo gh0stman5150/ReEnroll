@@ -21,6 +21,9 @@ remove explicitly targeted local accounts.
 
 ![ReEnroll deployment workflow](Extras/Images/ReEnrollDeployFrameworkCheckIn.png)
 
+Contributor guidance: [AGENTS.md](AGENTS.md) is authoritative for this
+repository's Jamf compatibility, safety and validation requirements.
+
 ## Features
 
 - Redeploy the Jamf framework silently or with a swiftDialog progress window.
