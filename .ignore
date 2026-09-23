@@ -1,3 +1,7 @@
 # Excluded from ripgrep-based search (including coding agents); still tracked.
 # Build output that duplicates lib/; search the sources instead.
 dist/
+
+# gh-aw generated agent and skill files, identical across repositories.
+.github/agents/agentic-workflows.md
+.github/skills/agentic-workflows/
