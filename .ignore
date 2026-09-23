@@ -1,0 +1,3 @@
+# Excluded from ripgrep-based search (including coding agents); still tracked.
+# Build output that duplicates lib/; search the sources instead.
+dist/
