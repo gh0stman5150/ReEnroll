@@ -6,6 +6,9 @@ function enrollDeviceReceipt() {
     state_set "DeviceEnrolledStatus" "Enrolled Device"
 }
 
+# Called only from failure paths (check-in, inventory and LAPS validation
+# errors), so both "true" and the default "failure" setting trigger the
+# profiles renew flow here; main's unconditional call handles "true" alone.
 function handleRenewProfilesOption() {
     case ${renewProfiles} in
         "true" )
@@ -13,7 +16,8 @@ function handleRenewProfilesOption() {
             inventoryError
             ;;
         "failure" )
-            infoOut "Profiles Renew set to: ${renewProfiles}, profiles renew command will be sent if the Jamf Framework deployment reports failures and the ReEnroll Invitation command fails"
+            infoOut "Profiles Renew set to: ${renewProfiles}, a failure was reported; sending the profiles renew command"
+            inventoryError
             ;;
         "false" )
             infoOut "Profiles Renew set to: ${renewProfiles}, skipping ..."
@@ -25,6 +29,15 @@ function handleRenewProfilesOption() {
 }
 
 function inventoryError() {
+    # inventoryError -> checkIn -> (failure) -> handleRenewProfilesOption can
+    # lead back here; the renew flow (dialog, profiles renew, LAPS deletion)
+    # must run at most once per execution.
+    if [[ "${inventoryErrorRan:-false}" == "true" ]]; then
+        warning "The profiles renew flow already ran this execution; not repeating it."
+        return 0
+    fi
+    inventoryErrorRan="true"
+
     if isDryRun; then
         state_set "ReEnrollNotificationStatus" "ReEnroll with notification"
         state_set "ReEnrollMethod" "Renewing Enrollment"

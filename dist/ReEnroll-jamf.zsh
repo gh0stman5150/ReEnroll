@@ -309,23 +309,26 @@ function readReEnrollSecret() {
     local readerOwner=""
     local readerMode=""
 
+    # Callers capture stdout as the secret, so diagnostics go to stderr; a
+    # warning on stdout would otherwise be loaded as the credential.
+
     if [[ -n "${reenrollCredentialReader}" ]]; then
         if [[ "${reenrollCredentialReader}" != /* || ! -x "${reenrollCredentialReader}" ]]; then
-            warning "Configured ReEnroll credential reader is not an executable absolute path."
+            warning "Configured ReEnroll credential reader is not an executable absolute path." >&2
             return 1
         fi
         readerOwner=$(/usr/bin/stat -f '%Su' "${reenrollCredentialReader}" 2>/dev/null || true)
         readerMode=$(/usr/bin/stat -f '%OLp' "${reenrollCredentialReader}" 2>/dev/null || true)
         if [[ "${readerOwner}" != "root" || "${readerMode}" != <-> ]]; then
-            warning "ReEnroll credential reader must be root-owned and not group/world writable."
+            warning "ReEnroll credential reader must be root-owned and not group/world writable." >&2
             return 1
         fi
         if (( (8#${readerMode} & 8#22) != 0 )); then
-            warning "ReEnroll credential reader must be root-owned and not group/world writable."
+            warning "ReEnroll credential reader must be root-owned and not group/world writable." >&2
             return 1
         fi
         if ! /usr/bin/codesign --verify --strict "${reenrollCredentialReader}" >/dev/null 2>&1; then
-            warning "ReEnroll credential reader does not have a valid code signature."
+            warning "ReEnroll credential reader does not have a valid code signature." >&2
             return 1
         fi
         "${reenrollCredentialReader}" "${account}" "${reenrollCredentialService}" 2>/dev/null
@@ -716,11 +719,47 @@ function extract_from_json() {
 
 function get_json_path() {
     JSON="$1" JSON_PATH="$2" /usr/bin/osascript -l JavaScript \
+        -e 'ObjC.import("stdlib")' \
         -e 'const env = $.NSProcessInfo.processInfo.environment' \
         -e 'let value = JSON.parse(env.objectForKey("JSON").js)' \
         -e 'for (const part of env.objectForKey("JSON_PATH").js.split(".")) { value = value[part.match(/^\d+$/) ? Number(part) : part] }' \
         -e 'if (value === undefined || value === null) { $.exit(1) }' \
         -e 'typeof value === "object" ? JSON.stringify(value) : String(value)'
+}
+
+# Writes "--option value" pairs as curl config lines. Request headers and
+# bodies carry the client secret and bearer token, and curl's argv is readable
+# by every local user through ps, so they go to a 0600 file instead.
+function writeCurlConfig() {
+    emulate -L zsh
+    local configFile="$1"
+    local option value
+    shift
+
+    while (( $# > 0 )); do
+        option="$1"
+        case "${option}" in
+            --get)
+                print -r -- "get" >> "${configFile}" || return 1
+                shift
+                continue
+                ;;
+            --header|--data|--data-raw|--data-urlencode) ;;
+            *)
+                print -u2 -- "writeCurlConfig: unsupported curl option '${option}'"
+                return 1
+                ;;
+        esac
+        (( $# >= 2 )) || { print -u2 -- "writeCurlConfig: ${option} has no value"; return 1; }
+        value="$2"
+        value="${value//\\/\\\\}"
+        value="${value//\"/\\\"}"
+        value="${value//$'\n'/\\n}"
+        value="${value//$'\r'/\\r}"
+        value="${value//$'\t'/\\t}"
+        print -r -- "${option#--} = \"${value}\"" >> "${configFile}" || return 1
+        shift 2
+    done
 }
 
 function jamfApiRequest() {
@@ -734,7 +773,12 @@ function jamfApiRequest() {
     JAMF_HTTP_BODY=""
     JAMF_HTTP_STATUS="000"
     JAMF_HTTP_CURL_EXIT=0
+    # Validate the options before anything is sent; the real config is then
+    # streamed to curl on stdin so secrets never reach argv or the disk.
+    writeCurlConfig /dev/null "$@" || return 1
     bodyFile=$(/usr/bin/mktemp /var/tmp/reenroll-http.XXXXXX) || return 1
+    # Global so cleanupTemporaryArtifacts removes it if the run is interrupted.
+    JAMF_HTTP_BODY_FILE="${bodyFile}"
     curlArgs=(
         --silent
         --show-error
@@ -751,10 +795,11 @@ function jamfApiRequest() {
         curlArgs+=(--retry 3 --retry-delay 2)
     fi
 
-    httpStatus=$(/usr/bin/curl "${curlArgs[@]}" "$@" "${url}")
+    httpStatus=$(writeCurlConfig /dev/stdout "$@" | /usr/bin/curl "${curlArgs[@]}" --config - "${url}"; exit ${pipestatus[2]})
     curlExit=$?
     JAMF_HTTP_BODY="$(<"${bodyFile}")"
     /bin/rm -f -- "${bodyFile}"
+    JAMF_HTTP_BODY_FILE=""
     JAMF_HTTP_STATUS="${httpStatus:-000}"
     JAMF_HTTP_CURL_EXIT="${curlExit}"
 
@@ -1267,16 +1312,23 @@ fi
 $rotatePasswordCommand
 
 log_message "Checking admin status for user: $loggedInUser"
-if /usr/sbin/dseditgroup -o checkmember -m "$loggedInUser" admin | /usr/bin/grep -q "is a member"; then
-    log_message "$loggedInUser is an admin. Removing from the admin group..."
+# Only demote an account that ReEnroll itself promoted (recorded by addAdmin);
+# a user who was already an administrator keeps their rights.
+promotedUser="\$(/usr/bin/defaults read "$reEnrollConfigFile" ReEnrollPromotedUser 2>/dev/null)"
+if [ -z "$loggedInUser" ] || [ "\$promotedUser" != "$loggedInUser" ]; then
+    log_message "ReEnroll did not promote $loggedInUser; leaving admin membership unchanged"
+elif /usr/sbin/dseditgroup -o checkmember -m "$loggedInUser" admin | /usr/bin/grep -q "is a member"; then
+    log_message "$loggedInUser was promoted by ReEnroll. Removing from the admin group..."
     /usr/sbin/dseditgroup -o edit -d "$loggedInUser" -t user admin
     if [ \$? -eq 0 ]; then
         log_message "$loggedInUser has been removed from the admin group"
+        /usr/bin/defaults delete "$reEnrollConfigFile" ReEnrollPromotedUser >/dev/null 2>&1
     else
         log_message "Failed to remove $loggedInUser from admin group"
     fi
 else
     log_message "$loggedInUser is not an admin"
+    /usr/bin/defaults delete "$reEnrollConfigFile" ReEnrollPromotedUser >/dev/null 2>&1
 fi
 
 log_message "Cleaning up LaunchDaemon files"
@@ -1517,7 +1569,26 @@ function check_user_exists() {
     fi
 }
 
+# Checks a local account password through OpenDirectory. The account name and
+# password reach osascript through its environment, which other local users
+# cannot read, instead of argv, which any user can read with ps. dscl -authonly
+# would expose the LAPS password on its command line.
+function verifyLocalAccountPassword() {
+    REENROLL_AUTH_USER="$1" REENROLL_AUTH_PASSWORD="$2" /usr/bin/osascript -l JavaScript \
+        -e 'ObjC.import("OpenDirectory")' \
+        -e 'ObjC.import("stdlib")' \
+        -e 'const env = $.NSProcessInfo.processInfo.environment' \
+        -e 'const node = $.ODNode.nodeWithSessionTypeError($.ODSession.defaultSession, $.kODNodeTypeLocalNodes, null)' \
+        -e 'const record = node.recordWithRecordTypeNameAttributesError($.kODRecordTypeUsers, env.objectForKey("REENROLL_AUTH_USER"), $(), null)' \
+        -e 'if (record.isNil()) { $.exit(2) }' \
+        -e 'if (!record.verifyPasswordError(env.objectForKey("REENROLL_AUTH_PASSWORD"), null)) { $.exit(1) }' \
+        -e '""' >/dev/null 2>&1
+}
+
 function validate_password() {
+    # Start from failure so an early return can never leave a stale success
+    # from an earlier check in the global that checkLAPSAccount reads.
+    authResult=1
     if isDryRun; then
         lapsPassword="dry-run-password"
         authResult=0
@@ -1544,7 +1615,7 @@ function validate_password() {
 
     infoOut "Authenticating $lapsAdminAccount password..."
     updateDialog "progresstext: Checking LAPS Admin Password credentials..."
-    dscl /Local/Default -authonly "$lapsAdminAccount" "$lapsPassword"
+    verifyLocalAccountPassword "$lapsAdminAccount" "$lapsPassword"
     authResult=$?
 
     if [ $authResult -eq 0 ]; then
@@ -1644,8 +1715,13 @@ function verifyLAPSCredentials() {
 
     scriptResult+="Check for LAPS account and password; "
 
+    # The counter is local so a nested verification (reEnrollInvitation ->
+    # rotateLAPSPassword -> verifyLAPSCredentials) cannot reset the outer
+    # loop's bound, and the enrollment invitation is sent at most once per
+    # run: each invitation deletes the LAPS account, re-enrolls and rotates
+    # the password, so repeating it on every failed check looped forever.
+    local LAPScounter=1
     lap_Status=1
-    LAPScounter=1
     until [[ "$lap_Status" -eq 0 ]] || [[ "$LAPScounter" -gt 2 ]]; do
         scriptResult+="Check ${LAPScounter} of 2: LAPS account not valid; waiting to re-check; "
         sleep 60
@@ -1653,8 +1729,13 @@ function verifyLAPSCredentials() {
         lap_Status=$?
 
         if [[ "$lap_Status" -ne 0 ]]; then
-            notice "Sending enrollment invitation..."
-            reEnrollInvitation
+            if [[ "${lapsReEnrollInvitationSent:-false}" == "true" ]]; then
+                warning "LAPS credentials are still invalid after the enrollment invitation; not sending another"
+            else
+                lapsReEnrollInvitationSent="true"
+                notice "Sending enrollment invitation..."
+                reEnrollInvitation
+            fi
         fi
 
         ((LAPScounter++))
@@ -1662,8 +1743,19 @@ function verifyLAPSCredentials() {
 }
 
 function checkLAPSAccountStatus() {
+    # checkIn already runs this on its success path and main calls it again;
+    # the second run repeated the 60s verification wait and rewrote the recon
+    # LaunchDaemon while the first instance could already be executing.
+    # The latch is set only after a successful check, so a re-check after a
+    # profile renewal still runs.
+    if [[ "${lapsAccountStatusChecked:-false}" == "true" ]]; then
+        infoOut "LAPS admin account status was already verified this run; skipping repeat"
+        return 0
+    fi
+
     if isDryRun; then
         verifyLAPSCredentials
+        [[ "$lap_Status" -eq 0 ]] && lapsAccountStatusChecked="true"
         state_set "ReEnrollNotificationStatus" "No Notification"
         webhookStatus="ReEnroll without notification"
         if [[ -z "$reEnrollMethod" ]]; then
@@ -1686,6 +1778,7 @@ function checkLAPSAccountStatus() {
     fi
 
     verifyLAPSCredentials
+    [[ "$lap_Status" -eq 0 ]] && lapsAccountStatusChecked="true"
 
     if [[ "$lap_Status" -eq 0 ]]; then
         infoOut "LAPS account and password are valid"
@@ -1722,6 +1815,9 @@ function enrollDeviceReceipt() {
     state_set "DeviceEnrolledStatus" "Enrolled Device"
 }
 
+# Called only from failure paths (check-in, inventory and LAPS validation
+# errors), so both "true" and the default "failure" setting trigger the
+# profiles renew flow here; main's unconditional call handles "true" alone.
 function handleRenewProfilesOption() {
     case ${renewProfiles} in
         "true" )
@@ -1729,7 +1825,8 @@ function handleRenewProfilesOption() {
             inventoryError
             ;;
         "failure" )
-            infoOut "Profiles Renew set to: ${renewProfiles}, profiles renew command will be sent if the Jamf Framework deployment reports failures and the ReEnroll Invitation command fails"
+            infoOut "Profiles Renew set to: ${renewProfiles}, a failure was reported; sending the profiles renew command"
+            inventoryError
             ;;
         "false" )
             infoOut "Profiles Renew set to: ${renewProfiles}, skipping ..."
@@ -1741,6 +1838,15 @@ function handleRenewProfilesOption() {
 }
 
 function inventoryError() {
+    # inventoryError -> checkIn -> (failure) -> handleRenewProfilesOption can
+    # lead back here; the renew flow (dialog, profiles renew, LAPS deletion)
+    # must run at most once per execution.
+    if [[ "${inventoryErrorRan:-false}" == "true" ]]; then
+        warning "The profiles renew flow already ran this execution; not repeating it."
+        return 0
+    fi
+    inventoryErrorRan="true"
+
     if isDryRun; then
         state_set "ReEnrollNotificationStatus" "ReEnroll with notification"
         state_set "ReEnrollMethod" "Renewing Enrollment"
@@ -2474,6 +2580,12 @@ function rm_if_exists() {
 }
 
 function cleanupTemporaryArtifacts() {
+    # A response body (possibly a LAPS password) left by an interrupted request.
+    if [[ -n "${JAMF_HTTP_BODY_FILE:-}" && -f "${JAMF_HTTP_BODY_FILE}" ]]; then
+        rm -f -- "${JAMF_HTTP_BODY_FILE}"
+        JAMF_HTTP_BODY_FILE=""
+    fi
+
     if [[ -f "${tempInventoryLog}" ]]; then
         quitOut "Removing ${tempInventoryLog} …"
         rm "${tempInventoryLog}"
@@ -2507,13 +2619,12 @@ function cleanupTemporaryArtifacts() {
     fi
 }
 
+# Any renew path (renewProfiles true or the default "failure") can promote the
+# console user. removeAdmin acts only on the account recorded by addAdmin, so
+# it is always safe to call here.
 function cleanupPrivileges() {
-    if [ "$renewProfiles" = "true" ]; then
-        infoOut "Removing admin access from computer"
-        removeAdmin
-    else
-        infoOut "Renew Profiles was set to $renewProfiles, skipping removing admin access from computer"
-    fi
+    infoOut "Removing any admin access granted by ReEnroll"
+    removeAdmin
 }
 
 function cleanupResources() {
@@ -2682,10 +2793,15 @@ function addAdmin() {
         return 0
     fi
 
-    if dseditgroup -o checkmember -m "$loggedInUser" admin | grep -q "not a member"; then
+    # dseditgroup reports "<user> is NOT a member of admin" in upper case, so the
+    # match must be case-insensitive or the promotion never happens.
+    if dseditgroup -o checkmember -m "$loggedInUser" admin | grep -qi "not a member"; then
         infoOut "${loggedInUser} is not an admin. Adding to the admin group..."
         updateDialog "progresstext: Adding ${loggedInUser} to the admin group..."
         /usr/sbin/dseditgroup -o edit -a "$loggedInUser" -t user admin
+        # Record the temporary grant so removeAdmin and the recon daemon demote
+        # only an account ReEnroll promoted, never a pre-existing administrator.
+        state_set "ReEnrollPromotedUser" "$loggedInUser"
         infoOut "${loggedInUser} has been added to the admin group."
         updateDialog "progresstext: ${loggedInUser} has been added to the admin group."
     else
@@ -2706,13 +2822,19 @@ function removeAdmin () {
         return 0
     fi
 
+    if [[ -z "$loggedInUser" || "$(state_get "ReEnrollPromotedUser")" != "$loggedInUser" ]]; then
+        quitOut "ReEnroll did not grant admin rights to ${loggedInUser:-the console user}; leaving group membership unchanged."
+        return 0
+    fi
+
     if dseditgroup -o checkmember -m "$loggedInUser" admin | grep -q "is a member"; then
-        quitOut "$loggedInUser is an admin. Removing from the admin group..."
+        quitOut "$loggedInUser was promoted by ReEnroll. Removing from the admin group..."
         /usr/sbin/dseditgroup -o edit -d "$loggedInUser" -t user admin
         quitOut "$loggedInUser has been removed from the admin group."
     else
         quitOut "$loggedInUser is not an admin."
     fi
+    /usr/bin/defaults delete "${reEnrollConfigFile}" "ReEnrollPromotedUser" >/dev/null 2>&1 || true
 }
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
@@ -2891,8 +3013,12 @@ function main() {
     quitScript
 }
 
-trap 'cleanupResources' EXIT
-trap 'handleTerminationSignal "INT"' INT
-trap 'handleTerminationSignal "TERM"' TERM
+# Run only when executed (as Jamf does); sourcing for tests loads the
+# functions without starting ReEnroll.
+if [[ "${ZSH_EVAL_CONTEXT}" != *:file ]]; then
+    trap 'cleanupResources' EXIT
+    trap 'handleTerminationSignal "INT"' INT
+    trap 'handleTerminationSignal "TERM"' TERM
 
-main "$@"
+    main "$@"
+fi

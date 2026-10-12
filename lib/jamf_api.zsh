@@ -45,11 +45,47 @@ function extract_from_json() {
 
 function get_json_path() {
     JSON="$1" JSON_PATH="$2" /usr/bin/osascript -l JavaScript \
+        -e 'ObjC.import("stdlib")' \
         -e 'const env = $.NSProcessInfo.processInfo.environment' \
         -e 'let value = JSON.parse(env.objectForKey("JSON").js)' \
         -e 'for (const part of env.objectForKey("JSON_PATH").js.split(".")) { value = value[part.match(/^\d+$/) ? Number(part) : part] }' \
         -e 'if (value === undefined || value === null) { $.exit(1) }' \
         -e 'typeof value === "object" ? JSON.stringify(value) : String(value)'
+}
+
+# Writes "--option value" pairs as curl config lines. Request headers and
+# bodies carry the client secret and bearer token, and curl's argv is readable
+# by every local user through ps, so they go to a 0600 file instead.
+function writeCurlConfig() {
+    emulate -L zsh
+    local configFile="$1"
+    local option value
+    shift
+
+    while (( $# > 0 )); do
+        option="$1"
+        case "${option}" in
+            --get)
+                print -r -- "get" >> "${configFile}" || return 1
+                shift
+                continue
+                ;;
+            --header|--data|--data-raw|--data-urlencode) ;;
+            *)
+                print -u2 -- "writeCurlConfig: unsupported curl option '${option}'"
+                return 1
+                ;;
+        esac
+        (( $# >= 2 )) || { print -u2 -- "writeCurlConfig: ${option} has no value"; return 1; }
+        value="$2"
+        value="${value//\\/\\\\}"
+        value="${value//\"/\\\"}"
+        value="${value//$'\n'/\\n}"
+        value="${value//$'\r'/\\r}"
+        value="${value//$'\t'/\\t}"
+        print -r -- "${option#--} = \"${value}\"" >> "${configFile}" || return 1
+        shift 2
+    done
 }
 
 function jamfApiRequest() {
@@ -63,7 +99,12 @@ function jamfApiRequest() {
     JAMF_HTTP_BODY=""
     JAMF_HTTP_STATUS="000"
     JAMF_HTTP_CURL_EXIT=0
+    # Validate the options before anything is sent; the real config is then
+    # streamed to curl on stdin so secrets never reach argv or the disk.
+    writeCurlConfig /dev/null "$@" || return 1
     bodyFile=$(/usr/bin/mktemp /var/tmp/reenroll-http.XXXXXX) || return 1
+    # Global so cleanupTemporaryArtifacts removes it if the run is interrupted.
+    JAMF_HTTP_BODY_FILE="${bodyFile}"
     curlArgs=(
         --silent
         --show-error
@@ -80,10 +121,11 @@ function jamfApiRequest() {
         curlArgs+=(--retry 3 --retry-delay 2)
     fi
 
-    httpStatus=$(/usr/bin/curl "${curlArgs[@]}" "$@" "${url}")
+    httpStatus=$(writeCurlConfig /dev/stdout "$@" | /usr/bin/curl "${curlArgs[@]}" --config - "${url}"; exit ${pipestatus[2]})
     curlExit=$?
     JAMF_HTTP_BODY="$(<"${bodyFile}")"
     /bin/rm -f -- "${bodyFile}"
+    JAMF_HTTP_BODY_FILE=""
     JAMF_HTTP_STATUS="${httpStatus:-000}"
     JAMF_HTTP_CURL_EXIT="${curlExit}"
 

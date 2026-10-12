@@ -35,7 +35,26 @@ function check_user_exists() {
     fi
 }
 
+# Checks a local account password through OpenDirectory. The account name and
+# password reach osascript through its environment, which other local users
+# cannot read, instead of argv, which any user can read with ps. dscl -authonly
+# would expose the LAPS password on its command line.
+function verifyLocalAccountPassword() {
+    REENROLL_AUTH_USER="$1" REENROLL_AUTH_PASSWORD="$2" /usr/bin/osascript -l JavaScript \
+        -e 'ObjC.import("OpenDirectory")' \
+        -e 'ObjC.import("stdlib")' \
+        -e 'const env = $.NSProcessInfo.processInfo.environment' \
+        -e 'const node = $.ODNode.nodeWithSessionTypeError($.ODSession.defaultSession, $.kODNodeTypeLocalNodes, null)' \
+        -e 'const record = node.recordWithRecordTypeNameAttributesError($.kODRecordTypeUsers, env.objectForKey("REENROLL_AUTH_USER"), $(), null)' \
+        -e 'if (record.isNil()) { $.exit(2) }' \
+        -e 'if (!record.verifyPasswordError(env.objectForKey("REENROLL_AUTH_PASSWORD"), null)) { $.exit(1) }' \
+        -e '""' >/dev/null 2>&1
+}
+
 function validate_password() {
+    # Start from failure so an early return can never leave a stale success
+    # from an earlier check in the global that checkLAPSAccount reads.
+    authResult=1
     if isDryRun; then
         lapsPassword="dry-run-password"
         authResult=0
@@ -62,7 +81,7 @@ function validate_password() {
 
     infoOut "Authenticating $lapsAdminAccount password..."
     updateDialog "progresstext: Checking LAPS Admin Password credentials..."
-    dscl /Local/Default -authonly "$lapsAdminAccount" "$lapsPassword"
+    verifyLocalAccountPassword "$lapsAdminAccount" "$lapsPassword"
     authResult=$?
 
     if [ $authResult -eq 0 ]; then
@@ -162,8 +181,13 @@ function verifyLAPSCredentials() {
 
     scriptResult+="Check for LAPS account and password; "
 
+    # The counter is local so a nested verification (reEnrollInvitation ->
+    # rotateLAPSPassword -> verifyLAPSCredentials) cannot reset the outer
+    # loop's bound, and the enrollment invitation is sent at most once per
+    # run: each invitation deletes the LAPS account, re-enrolls and rotates
+    # the password, so repeating it on every failed check looped forever.
+    local LAPScounter=1
     lap_Status=1
-    LAPScounter=1
     until [[ "$lap_Status" -eq 0 ]] || [[ "$LAPScounter" -gt 2 ]]; do
         scriptResult+="Check ${LAPScounter} of 2: LAPS account not valid; waiting to re-check; "
         sleep 60
@@ -171,8 +195,13 @@ function verifyLAPSCredentials() {
         lap_Status=$?
 
         if [[ "$lap_Status" -ne 0 ]]; then
-            notice "Sending enrollment invitation..."
-            reEnrollInvitation
+            if [[ "${lapsReEnrollInvitationSent:-false}" == "true" ]]; then
+                warning "LAPS credentials are still invalid after the enrollment invitation; not sending another"
+            else
+                lapsReEnrollInvitationSent="true"
+                notice "Sending enrollment invitation..."
+                reEnrollInvitation
+            fi
         fi
 
         ((LAPScounter++))
@@ -180,8 +209,19 @@ function verifyLAPSCredentials() {
 }
 
 function checkLAPSAccountStatus() {
+    # checkIn already runs this on its success path and main calls it again;
+    # the second run repeated the 60s verification wait and rewrote the recon
+    # LaunchDaemon while the first instance could already be executing.
+    # The latch is set only after a successful check, so a re-check after a
+    # profile renewal still runs.
+    if [[ "${lapsAccountStatusChecked:-false}" == "true" ]]; then
+        infoOut "LAPS admin account status was already verified this run; skipping repeat"
+        return 0
+    fi
+
     if isDryRun; then
         verifyLAPSCredentials
+        [[ "$lap_Status" -eq 0 ]] && lapsAccountStatusChecked="true"
         state_set "ReEnrollNotificationStatus" "No Notification"
         webhookStatus="ReEnroll without notification"
         if [[ -z "$reEnrollMethod" ]]; then
@@ -204,6 +244,7 @@ function checkLAPSAccountStatus() {
     fi
 
     verifyLAPSCredentials
+    [[ "$lap_Status" -eq 0 ]] && lapsAccountStatusChecked="true"
 
     if [[ "$lap_Status" -eq 0 ]]; then
         infoOut "LAPS account and password are valid"

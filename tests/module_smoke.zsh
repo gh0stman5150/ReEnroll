@@ -198,4 +198,78 @@ updatedComputerInventoryInfo
 assert_eq "${QUIT_CODE}" "0" "updatedComputerInventoryInfo should exit cleanly in dry run"
 assert_contains "${LAST_DRY_RUN}" "new Jamf site ID '200'" "updatedComputerInventoryInfo should log the target site update in dry run"
 
+renewProfiles="failure"
+INVENTORY_ERROR_CALLED=0
+handleRenewProfilesOption
+assert_eq "${INVENTORY_ERROR_CALLED}" "1" "handleRenewProfilesOption should run the renew flow on a failure path when renewProfiles is failure"
+
+# LAPS verification must stay bounded: a failed check sends one enrollment
+# invitation, and the invitation's nested rotate/verify must not restart the loop.
+typeset -g LAPS_CHECKS=0
+typeset -g LAPS_INVITES=0
+function isDryRun() { return 1; }
+function sleep() { :; }
+function checkLAPSAccount() { (( LAPS_CHECKS += 1 )); return 1; }
+function reEnrollInvitation() { (( LAPS_INVITES += 1 )); verifyLAPSCredentials; }
+management_id="dry-run-management-id"
+lapsPassword=""
+lapsReEnrollInvitationSent="false"
+# Production ReEnroll does not run with errexit; disable it so the stubbed
+# failing check is observed the way the endpoint script sees it.
+set +e
+verifyLAPSCredentials
+set -e
+assert_eq "${LAPS_INVITES}" "1" "verifyLAPSCredentials should send at most one enrollment invitation per run"
+assert_eq "${LAPS_CHECKS}" "4" "the outer and nested verification should each stop after two checks"
+assert_eq "${lap_Status}" "1" "verifyLAPSCredentials should report failure when the account never validates"
+function isDryRun() { return 0; }
+
+typeset -g LAPS_VERIFY_CALLS=0
+function verifyLAPSCredentials() { (( LAPS_VERIFY_CALLS += 1 )); lap_Status=0; }
+lapsAccountStatusChecked="false"
+skipLaunchDaemon="true"
+checkLAPSAccountStatus
+checkLAPSAccountStatus
+assert_eq "${LAPS_VERIFY_CALLS}" "1" "checkLAPSAccountStatus should verify LAPS credentials only once per run"
+
+# Jamf inventory API fallback: continue only past 400/404, stop on any other error.
+typeset -ga API_RESPONSES API_URLS
+function jamfApiRequest() {
+    API_URLS+=("$2")
+    JAMF_HTTP_STATUS="${API_RESPONSES[1]%%|*}"
+    JAMF_HTTP_BODY="${API_RESPONSES[1]#*|}"
+    API_RESPONSES=("${API_RESPONSES[@]:1}")
+    [[ "${JAMF_HTTP_STATUS}" == <200-299> ]]
+}
+serialNumber="TEST-SERIAL"
+API_URLS=()
+API_RESPONSES=('404|{}' '200|{"results":[{"id":"42"}]}')
+computerID=""
+jamfInventoryApiVersion=""
+apiResponse
+assert_eq "${jamfInventoryApiVersion}" "v2" "apiResponse should fall back from a 404 on v3 to v2"
+assert_eq "${computerID}" "42" "apiResponse should read the computer ID from the v2 response"
+assert_eq "${#API_URLS[@]}" "2" "apiResponse should stop after the first successful version"
+
+API_URLS=()
+API_RESPONSES=('500|{}' '200|{"results":[{"id":"42"}]}')
+set +e
+apiResponse
+api_status=$?
+set -e
+assert_eq "${api_status}" "1" "apiResponse should fail on a server error"
+assert_eq "${#API_URLS[@]}" "1" "apiResponse should not try older API versions after a non-400/404 error"
+
+curl_config_dir="$(/usr/bin/mktemp -d /tmp/reenroll-curl-test.XXXXXX)"
+curl_config="${curl_config_dir}/config"
+writeCurlConfig "${curl_config}" --header 'Authorization: Bearer tok"en' --get --data-urlencode 'client_secret=a\b c'
+assert_eq "$(/usr/bin/sed -n 1p "${curl_config}")" 'header = "Authorization: Bearer tok\"en"' "writeCurlConfig should escape quotes in header values"
+assert_eq "$(/usr/bin/sed -n 2p "${curl_config}")" 'get' "writeCurlConfig should pass value-less --get through"
+assert_eq "$(/usr/bin/sed -n 3p "${curl_config}")" 'data-urlencode = "client_secret=a\\b c"' "writeCurlConfig should escape backslashes in secrets"
+if writeCurlConfig "${curl_config}" --insecure 2>/dev/null; then
+    print -u2 -- "Assertion failed: writeCurlConfig should reject unsupported options"
+    exit 1
+fi
+/bin/rm -rf -- "${curl_config_dir}"
+
 print -- "module_smoke: ok"

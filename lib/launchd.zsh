@@ -72,16 +72,23 @@ fi
 $rotatePasswordCommand
 
 log_message "Checking admin status for user: $loggedInUser"
-if /usr/sbin/dseditgroup -o checkmember -m "$loggedInUser" admin | /usr/bin/grep -q "is a member"; then
-    log_message "$loggedInUser is an admin. Removing from the admin group..."
+# Only demote an account that ReEnroll itself promoted (recorded by addAdmin);
+# a user who was already an administrator keeps their rights.
+promotedUser="\$(/usr/bin/defaults read "$reEnrollConfigFile" ReEnrollPromotedUser 2>/dev/null)"
+if [ -z "$loggedInUser" ] || [ "\$promotedUser" != "$loggedInUser" ]; then
+    log_message "ReEnroll did not promote $loggedInUser; leaving admin membership unchanged"
+elif /usr/sbin/dseditgroup -o checkmember -m "$loggedInUser" admin | /usr/bin/grep -q "is a member"; then
+    log_message "$loggedInUser was promoted by ReEnroll. Removing from the admin group..."
     /usr/sbin/dseditgroup -o edit -d "$loggedInUser" -t user admin
     if [ \$? -eq 0 ]; then
         log_message "$loggedInUser has been removed from the admin group"
+        /usr/bin/defaults delete "$reEnrollConfigFile" ReEnrollPromotedUser >/dev/null 2>&1
     else
         log_message "Failed to remove $loggedInUser from admin group"
     fi
 else
     log_message "$loggedInUser is not an admin"
+    /usr/bin/defaults delete "$reEnrollConfigFile" ReEnrollPromotedUser >/dev/null 2>&1
 fi
 
 log_message "Cleaning up LaunchDaemon files"

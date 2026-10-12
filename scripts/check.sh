@@ -35,6 +35,7 @@ if grep -q 'sourceModule "' dist/ReEnroll-jamf.zsh; then
 fi
 
 zsh tests/module_smoke.zsh
+zsh tests/entrypoint_smoke.zsh
 
 if grep -R -n 'eval[[:space:]]' lib ReEnroll.sh; then
     echo "Unsafe eval invocation found." >&2

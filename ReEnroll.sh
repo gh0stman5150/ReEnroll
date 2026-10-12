@@ -308,23 +308,26 @@ function readReEnrollSecret() {
     local readerOwner=""
     local readerMode=""
 
+    # Callers capture stdout as the secret, so diagnostics go to stderr; a
+    # warning on stdout would otherwise be loaded as the credential.
+
     if [[ -n "${reenrollCredentialReader}" ]]; then
         if [[ "${reenrollCredentialReader}" != /* || ! -x "${reenrollCredentialReader}" ]]; then
-            warning "Configured ReEnroll credential reader is not an executable absolute path."
+            warning "Configured ReEnroll credential reader is not an executable absolute path." >&2
             return 1
         fi
         readerOwner=$(/usr/bin/stat -f '%Su' "${reenrollCredentialReader}" 2>/dev/null || true)
         readerMode=$(/usr/bin/stat -f '%OLp' "${reenrollCredentialReader}" 2>/dev/null || true)
         if [[ "${readerOwner}" != "root" || "${readerMode}" != <-> ]]; then
-            warning "ReEnroll credential reader must be root-owned and not group/world writable."
+            warning "ReEnroll credential reader must be root-owned and not group/world writable." >&2
             return 1
         fi
         if (( (8#${readerMode} & 8#22) != 0 )); then
-            warning "ReEnroll credential reader must be root-owned and not group/world writable."
+            warning "ReEnroll credential reader must be root-owned and not group/world writable." >&2
             return 1
         fi
         if ! /usr/bin/codesign --verify --strict "${reenrollCredentialReader}" >/dev/null 2>&1; then
-            warning "ReEnroll credential reader does not have a valid code signature."
+            warning "ReEnroll credential reader does not have a valid code signature." >&2
             return 1
         fi
         "${reenrollCredentialReader}" "${account}" "${reenrollCredentialService}" 2>/dev/null
@@ -765,6 +768,12 @@ function rm_if_exists() {
 }
 
 function cleanupTemporaryArtifacts() {
+    # A response body (possibly a LAPS password) left by an interrupted request.
+    if [[ -n "${JAMF_HTTP_BODY_FILE:-}" && -f "${JAMF_HTTP_BODY_FILE}" ]]; then
+        rm -f -- "${JAMF_HTTP_BODY_FILE}"
+        JAMF_HTTP_BODY_FILE=""
+    fi
+
     if [[ -f "${tempInventoryLog}" ]]; then
         quitOut "Removing ${tempInventoryLog} …"
         rm "${tempInventoryLog}"
@@ -798,13 +807,12 @@ function cleanupTemporaryArtifacts() {
     fi
 }
 
+# Any renew path (renewProfiles true or the default "failure") can promote the
+# console user. removeAdmin acts only on the account recorded by addAdmin, so
+# it is always safe to call here.
 function cleanupPrivileges() {
-    if [ "$renewProfiles" = "true" ]; then
-        infoOut "Removing admin access from computer"
-        removeAdmin
-    else
-        infoOut "Renew Profiles was set to $renewProfiles, skipping removing admin access from computer"
-    fi
+    infoOut "Removing any admin access granted by ReEnroll"
+    removeAdmin
 }
 
 function cleanupResources() {
@@ -973,10 +981,15 @@ function addAdmin() {
         return 0
     fi
 
-    if dseditgroup -o checkmember -m "$loggedInUser" admin | grep -q "not a member"; then
+    # dseditgroup reports "<user> is NOT a member of admin" in upper case, so the
+    # match must be case-insensitive or the promotion never happens.
+    if dseditgroup -o checkmember -m "$loggedInUser" admin | grep -qi "not a member"; then
         infoOut "${loggedInUser} is not an admin. Adding to the admin group..."
         updateDialog "progresstext: Adding ${loggedInUser} to the admin group..."
         /usr/sbin/dseditgroup -o edit -a "$loggedInUser" -t user admin
+        # Record the temporary grant so removeAdmin and the recon daemon demote
+        # only an account ReEnroll promoted, never a pre-existing administrator.
+        state_set "ReEnrollPromotedUser" "$loggedInUser"
         infoOut "${loggedInUser} has been added to the admin group."
         updateDialog "progresstext: ${loggedInUser} has been added to the admin group."
     else
@@ -997,13 +1010,19 @@ function removeAdmin () {
         return 0
     fi
 
+    if [[ -z "$loggedInUser" || "$(state_get "ReEnrollPromotedUser")" != "$loggedInUser" ]]; then
+        quitOut "ReEnroll did not grant admin rights to ${loggedInUser:-the console user}; leaving group membership unchanged."
+        return 0
+    fi
+
     if dseditgroup -o checkmember -m "$loggedInUser" admin | grep -q "is a member"; then
-        quitOut "$loggedInUser is an admin. Removing from the admin group..."
+        quitOut "$loggedInUser was promoted by ReEnroll. Removing from the admin group..."
         /usr/sbin/dseditgroup -o edit -d "$loggedInUser" -t user admin
         quitOut "$loggedInUser has been removed from the admin group."
     else
         quitOut "$loggedInUser is not an admin."
     fi
+    /usr/bin/defaults delete "${reEnrollConfigFile}" "ReEnrollPromotedUser" >/dev/null 2>&1 || true
 }
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
@@ -1182,8 +1201,12 @@ function main() {
     quitScript
 }
 
-trap 'cleanupResources' EXIT
-trap 'handleTerminationSignal "INT"' INT
-trap 'handleTerminationSignal "TERM"' TERM
+# Run only when executed (as Jamf does); sourcing for tests loads the
+# functions without starting ReEnroll.
+if [[ "${ZSH_EVAL_CONTEXT}" != *:file ]]; then
+    trap 'cleanupResources' EXIT
+    trap 'handleTerminationSignal "INT"' INT
+    trap 'handleTerminationSignal "TERM"' TERM
 
-main "$@"
+    main "$@"
+fi
