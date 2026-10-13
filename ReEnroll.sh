@@ -21,6 +21,9 @@ scriptLog="$folder_path/ReEnroll.log"
 reEnrollConfigFile="$folder_path/ReEnroll.plist"
 # Cleanup guard
 cleanupHasRun="false"
+# Longest a temporary admin grant to the console user may last before the
+# admin guard LaunchDaemon revokes it, even if the run is still going
+adminGrantMaxSeconds="3600"
 scriptDirectory="$(cd -- "$(dirname -- "$0")" && pwd -P)"
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
@@ -56,7 +59,10 @@ lapsAdminAccount="${6:-}"                                             # [ add th
 skipAccountDeletion="false"                                         # [ false (default) | true ]
 # Define the exempt user list from being deleted (Add the username in quotes, with a space in between each)
 exempt_users=("Shared" "Guest" "$loggedInUser")                     # [ add the exempt user list here ]
-# Define the targeted user list to be deleted (Add the username in quotes, with a space in between each) 
+# Define the targeted user list to be deleted (Add the username in quotes, with a space in between each)
+# A targeted account is deleted only when its UID is above 500, it is not the console user or exempt,
+# and it is not an administrator. Its home folder is removed only when it is a real directory directly
+# under /Users (not Shared, not a symlink) owned by that account; otherwise it is left in place.
 targeted_users=("$lapsAdminAccount" "anotherAccount" )              # [ add the targeted user list here ]
 # Jamf Enrollment Invitation ID (https:/company.jamfcloud.com/enroll?invitation=1542270881__;!!KwNVnq) (Invitation ID in this example would be: 1542270881)
 enrollmentInvitation="${7:-}"                                        # [ add the Invitation ID here ]
@@ -117,6 +123,9 @@ fi
 timestamp=$(date +"%Y-%m-%d %I:%M:%S %p %Z")
 # Dialog Binary
 dialogBinary="/usr/local/bin/dialog"
+# swiftDialog application bundle; its presence selects the swiftDialog
+# workflow on macOS 12 and later (otherwise osascript is used)
+dialogAppPath="/Library/Application Support/Dialog/Dialog.app"
 dialogPid=""
 caffeinatePid=""
 # Dialog temporary command files
@@ -538,30 +547,27 @@ function createLastLogPosition() {
     duplicate_jamfLogFile="$duplicate_log_dir/jamf_position_$timestamp.log"
     preFlight "Duplicate Log File location: $duplicate_jamfLogFile"
 
-    # Find the last position marker or start from the beginning if not found
-    if [[ -f "$marker_file" && -f $jamfLogFile ]]; then
-        lastPosition=$(cat "$marker_file")
-    else 
+    # The marker file holds a byte offset into jamf.log; an empty or missing
+    # marker starts from the beginning of the log.
+    if [[ ! -f $jamfLogFile ]]; then
         preFlight "Creating jamf log file and setting error position as zero"
         touch "$jamfLogFile"
         chmod 755 "$jamfLogFile"
-        lastPosition=0
+        print -r -- "0" > "$marker_file"
     fi
 
-    # Copy new entries from jamf.log to the duplicate log file
+    # Copy new entries from jamf.log to the duplicate log file and record the
+    # new byte offset in the marker file (copyNewJamfLogEntries, jamf_api.zsh)
     if [ -f "$jamfLogFile" ]; then
-        tail -n +$((lastPosition + 1)) "$jamfLogFile" > "$duplicate_jamfLogFile"
-        preFlight "jamf log file exists. Tailing new entries from log file to duplicate log file" 
-    else 
+        : > "$duplicate_jamfLogFile"
+        copyNewJamfLogEntries || error "Unable to read the jamf log file"
+        preFlight "jamf log file exists. Copied new entries from log file to duplicate log file"
+    else
         error "jamf log file not found"
     fi
-
-    # Update the marker file with the new position
-    wc -l "$jamfLogFile" | awk '{print $1}' > "$marker_file"
     preFlight "Updating marker file"
 
     # Echo out the last position on the marker file
-    lastPosition=$(cat "$marker_file")
     preFlight "Last position of marker file: $lastPosition"
 }
 
@@ -617,24 +623,51 @@ fi
 # Pre-flight Check: Confirm Dock is running / user is at Desktop
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
+# The account that owns the console right now ("root" at the login window).
+function liveConsoleUser() {
+    /usr/bin/stat -f '%Su' /dev/console 2>/dev/null
+}
+
+# Waits up to dockFinderChecks checks, 2 seconds apart, for Finder and Dock.
+# Only the swiftDialog progress UI ($8 true) needs a desktop: without it, a
+# run at the login window continues at once and a desktop that never appears
+# is logged as a warning, so recurring and enrollment policies stay unattended.
 function dockCheck() {
+    local dockFinderChecks=10
+    local check consoleUser
 
     preFlight "Checking if Finder & Dock are running"
 
-    DockFinderCounter="1"
-
-    until [[ "${DockFinderCounter}" -gt "10" ]] || (pgrep -q -x "Finder" && pgrep -q -x "Dock"); do
-    preFlight "Finder & Dock are NOT running; pausing for 1 second"
-        sleep 2
-        ((DockFinderCounter++))
-
-        if [[ "${DockFinderCounter}" -gt "10" ]] || ! pgrep -q -x "Finder" || ! pgrep -q -x "Dock"; then
-            error "Finder or Dock not found or timeout reached; exiting"
-            quitScript 1
-        else
+    for (( check = 1; check <= dockFinderChecks; check++ )); do
+        if /usr/bin/pgrep -q -x "Finder" && /usr/bin/pgrep -q -x "Dock"; then
             preFlight "Finder & Dock are running; proceeding"
+            return 0
+        fi
+
+        if [[ "${displayReEnrollDialog}" != "true" ]]; then
+            consoleUser="$(liveConsoleUser)" || consoleUser=""
+            case "${consoleUser}" in
+                ""|root|loginwindow|_mbsetupuser)
+                    preFlight "No user is logged in at the desktop (console: ${consoleUser:-none}); continuing unattended"
+                    return 0
+                    ;;
+            esac
+        fi
+
+        if (( check < dockFinderChecks )); then
+            preFlight "Finder & Dock are NOT running (check ${check} of ${dockFinderChecks}); pausing for 2 seconds"
+            sleep 2
         fi
     done
+
+    if [[ "${displayReEnrollDialog}" == "true" ]]; then
+        error "Finder or Dock is still not running after ${dockFinderChecks} checks; the ReEnroll dialog needs a logged-in desktop; exiting"
+        quitScript 1
+        return 1
+    fi
+
+    warning "Finder or Dock is still not running after ${dockFinderChecks} checks; continuing unattended"
+    return 0
 }
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
@@ -808,8 +841,9 @@ function cleanupTemporaryArtifacts() {
 }
 
 # Any renew path (renewProfiles true or the default "failure") can promote the
-# console user. removeAdmin acts only on the account recorded by addAdmin, so
-# it is always safe to call here.
+# console user. removeAdmin acts only on a grant addAdmin recorded in this run,
+# so it is always safe to call here. A run that never reaches this trap is
+# covered by the admin guard LaunchDaemon and the next run's startup check.
 function cleanupPrivileges() {
     infoOut "Removing any admin access granted by ReEnroll"
     removeAdmin
@@ -912,6 +946,10 @@ function state_set_date() {
     /usr/bin/defaults write "${reEnrollConfigFile}" "${1}" -date "${2}"
 }
 
+function state_delete() {
+    /usr/bin/defaults delete "${reEnrollConfigFile}" "${1}" >/dev/null 2>&1 || true
+}
+
 # Create Property List
 function propertyList() {
     local stateFileExists="false"
@@ -948,6 +986,10 @@ function propertyList() {
 function runInitialChecks() {
     propertyList
     rootCheck
+    # Before dockCheck, which exits when the progress dialog is requested and
+    # no GUI session is ready, so even such a run revokes rights left by a
+    # run that was killed.
+    revokeStaleAdminGrant
     dockCheck
 }
 
@@ -986,16 +1028,100 @@ function addAdmin() {
     if dseditgroup -o checkmember -m "$loggedInUser" admin | grep -qi "not a member"; then
         infoOut "${loggedInUser} is not an admin. Adding to the admin group..."
         updateDialog "progresstext: Adding ${loggedInUser} to the admin group..."
-        /usr/sbin/dseditgroup -o edit -a "$loggedInUser" -t user admin
-        # Record the temporary grant so removeAdmin and the recon daemon demote
-        # only an account ReEnroll promoted, never a pre-existing administrator.
-        state_set "ReEnrollPromotedUser" "$loggedInUser"
+        # Record the temporary grant and arm the admin guard LaunchDaemon
+        # before promoting, so the grant is revoked even if this run is killed,
+        # times out or the Mac restarts before the EXIT trap demotes. Only a
+        # recorded account is ever demoted, never a pre-existing administrator.
+        recordAdminGrant "$loggedInUser"
+        if ! installAdminGuardDaemon; then
+            error "Unable to arm the admin guard LaunchDaemon; not granting ${loggedInUser} admin rights."
+            revokeAdminGrant "$loggedInUser"
+            return 1
+        fi
+        if ! /usr/sbin/dseditgroup -o edit -a "$loggedInUser" -t user admin; then
+            error "Unable to add ${loggedInUser} to the admin group."
+            revokeAdminGrant "$loggedInUser"
+            return 1
+        fi
         infoOut "${loggedInUser} has been added to the admin group."
         updateDialog "progresstext: ${loggedInUser} has been added to the admin group."
     else
         infoOut "${loggedInUser} is already an admin."
         updateDialog "progresstext: ${loggedInUser} is already an admin."
     fi
+}
+
+# The grant record: who was promoted, by which ReEnroll process, and when.
+function recordAdminGrant() {
+    state_set "ReEnrollPromotedUser" "$1"
+    state_set "ReEnrollPromotedPID" "${reEnrollPID}"
+    state_set "ReEnrollPromotedAt" "$(/bin/date +%s)"
+}
+
+function clearAdminGrantRecord() {
+    state_delete "ReEnrollPromotedUser"
+    state_delete "ReEnrollPromotedPID"
+    state_delete "ReEnrollPromotedAt"
+}
+
+# Succeeds while another ReEnroll run that recorded the grant is still going:
+# this boot began before the grant, its process is alive and the grant is
+# younger than adminGrantMaxSeconds. The admin guard applies the same test.
+function adminGrantRunActive() {
+    local promotedPID promotedAt bootTime now
+
+    promotedPID="$(state_get "ReEnrollPromotedPID")"
+    promotedAt="$(state_get "ReEnrollPromotedAt")"
+    [[ "${promotedPID}" == <2-> && "${promotedAt}" == <1-> ]] || return 1
+    [[ "${promotedPID}" != "${reEnrollPID}" ]] || return 1
+    bootTime="$(/usr/sbin/sysctl -n kern.boottime 2>/dev/null)"
+    bootTime="${${bootTime#*sec = }%%,*}"
+    now="$(/bin/date +%s)"
+    [[ "${bootTime}" == <1-> && "${now}" == <1-> ]] || return 1
+    (( bootTime <= promotedAt && now - promotedAt < ${adminGrantMaxSeconds:-3600} )) || return 1
+    kill -0 "${promotedPID}" 2>/dev/null
+}
+
+# Demotes an account ReEnroll recorded as promoted. The record and the admin
+# guard are removed only once the account is no longer an administrator, so a
+# failed demotion is retried by the guard.
+function revokeAdminGrant() {
+    local promotedUser="$1"
+
+    if dseditgroup -o checkmember -m "${promotedUser}" admin | grep -q "is a member"; then
+        infoOut "${promotedUser} was promoted by ReEnroll. Removing from the admin group..."
+        if ! /usr/sbin/dseditgroup -o edit -d "${promotedUser}" -t user admin; then
+            error "Unable to remove ${promotedUser} from the admin group; the admin guard LaunchDaemon will retry."
+            return 1
+        fi
+        infoOut "${promotedUser} has been removed from the admin group."
+    else
+        infoOut "${promotedUser} is not an admin."
+    fi
+    clearAdminGrantRecord
+    removeAdminGuardDaemon
+}
+
+# Startup: revoke a grant left by an earlier run that was killed, timed out or
+# interrupted by a restart, whatever renewProfiles is set to.
+function revokeStaleAdminGrant() {
+    local promotedUser
+
+    promotedUser="$(state_get "ReEnrollPromotedUser")"
+    [[ -n "${promotedUser}" ]] || return 0
+
+    if isDryRun; then
+        dryRunOut "Would remove the admin rights an earlier ReEnroll run granted to ${promotedUser}"
+        return 0
+    fi
+
+    if adminGrantRunActive; then
+        notice "Another ReEnroll run that granted ${promotedUser} admin rights is still running; leaving the grant to that run and the admin guard."
+        return 0
+    fi
+
+    warning "An earlier ReEnroll run granted ${promotedUser} admin rights and did not remove them; removing them now."
+    revokeAdminGrant "${promotedUser}"
 }
 
 
@@ -1010,24 +1136,121 @@ function removeAdmin () {
         return 0
     fi
 
-    if [[ -z "$loggedInUser" || "$(state_get "ReEnrollPromotedUser")" != "$loggedInUser" ]]; then
-        quitOut "ReEnroll did not grant admin rights to ${loggedInUser:-the console user}; leaving group membership unchanged."
+    # Act only on a grant this run recorded; one left by another run is
+    # handled by that run, the admin guard or the next run's startup check.
+    if [[ -z "$loggedInUser" || "$(state_get "ReEnrollPromotedUser")" != "$loggedInUser" \
+        || "$(state_get "ReEnrollPromotedPID")" != "${reEnrollPID}" ]]; then
+        quitOut "ReEnroll did not grant admin rights to ${loggedInUser:-the console user} in this run; leaving group membership unchanged."
         return 0
     fi
 
-    if dseditgroup -o checkmember -m "$loggedInUser" admin | grep -q "is a member"; then
-        quitOut "$loggedInUser was promoted by ReEnroll. Removing from the admin group..."
-        /usr/sbin/dseditgroup -o edit -d "$loggedInUser" -t user admin
-        quitOut "$loggedInUser has been removed from the admin group."
-    else
-        quitOut "$loggedInUser is not an admin."
-    fi
-    /usr/bin/defaults delete "${reEnrollConfigFile}" "ReEnrollPromotedUser" >/dev/null 2>&1 || true
+    revokeAdminGrant "$loggedInUser"
 }
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 # Find User Accounts and Remove
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+# Home folders that account cleanup may remove live directly in this folder.
+userHomeRoot="/Users"
+
+# Sets removableHomeDirectory to the account's home folder when it is safe to
+# remove as root: a real directory (not a symlink, no symlinked or ".."
+# component) directly under userHomeRoot, not Shared, and owned by the
+# account's UID. Otherwise clears it, sets homeRemovalReason and fails.
+function checkRemovableHomeDirectory() {
+    local account="$1"
+    local accountUID="$2"
+    local home folderName homeOwner
+
+    removableHomeDirectory=""
+    homeRemovalReason=""
+
+    home="$(localAccountAttribute "${account}" NFSHomeDirectory)" || home=""
+    folderName="${home#"${userHomeRoot}"/}"
+    if [[ -z "${home}" ]]; then
+        homeRemovalReason="the account record has no home folder"
+        return 1
+    fi
+    if [[ "${home}" != "${userHomeRoot}"/* || "${folderName}" == */* \
+        || "${folderName}" == (|.|..|Shared) ]]; then
+        homeRemovalReason="${home} is not a user folder directly under ${userHomeRoot}"
+        return 1
+    fi
+    if [[ ! -e "${home}" && ! -L "${home}" ]]; then
+        homeRemovalReason="${home} does not exist"
+        return 1
+    fi
+    if [[ -L "${home}" || ! -d "${home}" ]]; then
+        homeRemovalReason="${home} is not a real directory"
+        return 1
+    fi
+    if [[ "${home:A}" != "${home}" ]]; then
+        homeRemovalReason="${home} resolves to ${home:A}"
+        return 1
+    fi
+    homeOwner="$(/usr/bin/stat -f '%u' "${home}" 2>/dev/null)" || homeOwner=""
+    if [[ "${homeOwner}" != "${accountUID}" ]]; then
+        homeRemovalReason="${home} is owned by UID ${homeOwner:-unknown}, not ${account} (UID ${accountUID})"
+        return 1
+    fi
+
+    removableHomeDirectory="${home}"
+}
+
+# Deletes one targeted account (already checked against exempt_users) and its
+# home folder. Refuses an invalid name, a UID of 500 or below, the console
+# user and administrators, including when admin membership cannot be read.
+function removeTargetedAccount() {
+    local user="$1"
+    local removable=0 admin_status=0
+
+    localAccountRemovable "$user" || removable=$?
+    case ${removable} in
+        0) ;;
+        2)
+            notice "User $user no longer exists; nothing to remove"
+            return 0
+            ;;
+        *)
+            warning "Not removing $user: ${accountRemovalReason}"
+            return 1
+            ;;
+    esac
+    if (( removableAccountUID <= 500 )); then
+        warning "Not removing $user: UID ${removableAccountUID} is not above 500"
+        return 1
+    fi
+
+    localAccountIsAdmin "$user" || admin_status=$?
+    case ${admin_status} in
+        0)
+            infoOut "User $user was found to be a Local Admin, ignoring..."
+            return 0
+            ;;
+        1) ;;
+        *)
+            warning "Unable to determine whether $user is a Local Admin; leaving the account in place"
+            return 1
+            ;;
+    esac
+
+    # Read the home folder before the record that names it is deleted.
+    checkRemovableHomeDirectory "$user" "$removableAccountUID" || true
+
+    infoOut "Found user $user in targeted list, deleting the account..."
+    if ! /usr/bin/dscl . -delete "/Users/$user"; then
+        error "Unable to delete user $user; leaving its home folder in place"
+        return 1
+    fi
+
+    if [[ -n "${removableHomeDirectory}" ]]; then
+        infoOut "Deleting ${removableHomeDirectory} for $user"
+        /bin/rm -rf -- "${removableHomeDirectory}" || error "Unable to delete ${removableHomeDirectory}"
+    else
+        warning "Leaving the home folder of $user in place: ${homeRemovalReason}"
+    fi
+}
 
 # Find User Accounts and Remove
 function findUsersandRemove() {
@@ -1056,47 +1279,52 @@ function findUsersandRemove() {
         error "lapsAdminAccount is empty"
     fi
 
-    # Demote LAPS admin account to be removed
-    infoOut "Demoting $lapsAdminAccount account"
-
-/usr/sbin/dseditgroup -o edit -d "$lapsAdminAccount" -t user admin
-
-RESULT=()
-
-# Read the list of users with UniqueID greater than 500
-while read -r user; do
-    userHome=$(dscl . read /Users/"$user" NFSHomeDirectory | awk '{print $NF}')
-
-    found_in_exempt_list=false
-
-    for exempt_user in "${exempt_users[@]}"; do
-        if [[ "$user" == "$exempt_user" ]]; then
-            RESULT+=("$(infoOut "Found user $user in exempt list, ignoring...\n")")
-            found_in_exempt_list=true
-            break
-        fi
-    done
-
-     # Check if user is a local admin
-    if ! $found_in_exempt_list; then
-        RESULT+=("$(infoOut "User $user not found in exempt list, checking admin status...\n")")
-        if dseditgroup -o checkmember -u "$user" admin 1 >/dev/null; then
-            RESULT+=("$(infoOut "User $user was found to be a Local Admin, ignoring...\n")")
-        else
-            # Check if user is in targeted list
-            for targeted_user in "${targeted_users[@]}"; do
-                if [[ "$user" == "$targeted_user" ]]; then
-                    RESULT+=("$(infoOut "Found user $user in targeted list, $userHome will be deleted...\n")")
-                    dscl . delete /Users/"$user"
-                    rm -rf "$userHome"
-                    break
-                fi
-            done
-        fi
+    # Demote the LAPS admin account so the admin check below lets it be
+    # removed. The deletion safety checks apply: never the console user, an
+    # exempt account or a system account.
+    if [[ -n "$lapsAdminAccount" ]]; then
+        local laps_removable=0
+        localAccountRemovable "$lapsAdminAccount" || laps_removable=$?
+        case ${laps_removable} in
+            0)
+                infoOut "Demoting $lapsAdminAccount account"
+                /usr/sbin/dseditgroup -o edit -d "$lapsAdminAccount" -t user admin || \
+                    warning "Unable to remove $lapsAdminAccount from the admin group"
+                ;;
+            2) notice "LAPS admin account $lapsAdminAccount does not exist; nothing to demote" ;;
+            *) error "Not demoting $lapsAdminAccount: ${accountRemovalReason}" ;;
+        esac
     fi
-    done < <(dscl . list /Users UniqueID | awk '$2 > 500 {print $1}')
 
-    echo -e "${RESULT[@]}"
+    local user exempt_user targeted_user is_exempt is_targeted
+
+    # Read the list of users with UniqueID greater than 500
+    while read -r user; do
+        [[ -n "$user" ]] || continue
+
+        is_exempt=false
+        for exempt_user in "${exempt_users[@]}"; do
+            if [[ "$user" == "$exempt_user" ]]; then
+                is_exempt=true
+                break
+            fi
+        done
+        if [[ "$is_exempt" == "true" ]]; then
+            infoOut "Found user $user in exempt list, ignoring..."
+            continue
+        fi
+
+        is_targeted=false
+        for targeted_user in "${targeted_users[@]}"; do
+            if [[ -n "$targeted_user" && "$user" == "$targeted_user" ]]; then
+                is_targeted=true
+                break
+            fi
+        done
+        if [[ "$is_targeted" == "true" ]]; then
+            removeTargetedAccount "$user" || true
+        fi
+    done < <(/usr/bin/dscl . -list /Users UniqueID | /usr/bin/awk '$2 > 500 {print $1}')
 
     elif [ "$skipAccountDeletion" = "" ]; then
         infoOut "Skip Account Deletion is set blank, skipping"
@@ -1117,7 +1345,8 @@ function main() {
     fi
 
     findUsersandRemove
-    enrollDeviceReceipt
+    # The "Enrolled Device" receipt is recorded later, by enrollDeviceReceipt,
+    # only once this run has evidence of enrollment (see lib/enrollment.zsh).
 
     if [ -z "$client_id" ] || [ -z "$client_secret" ]; then
         if isDryRun; then

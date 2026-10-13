@@ -228,7 +228,11 @@ function computerIDLookup() {
     fi
 }
 
+# Pass "false" to read the live site without saving it over the site that
+# ReEnroll recorded before redeployment (updatedComputerInventoryInfo).
 function computerInventoryInfo() {
+    local persistSite="${1:-true}"
+
     computerName="$(get_json_path "${inventoryDetailJson}" "general.name" 2>/dev/null || true)"
     computerSerialNumber="$(get_json_path "${inventoryDetailJson}" "hardware.serialNumber" 2>/dev/null || true)"
     computerModel="$(get_json_path "${inventoryDetailJson}" "hardware.model" 2>/dev/null || true)"
@@ -238,11 +242,16 @@ function computerInventoryInfo() {
     computerSiteID="$(get_json_path "${inventoryDetailJson}" "general.site.id" 2>/dev/null || true)"
 
     infoOut "Computer Site ID: $computerSiteID"
-    infoOut "Adding computer site ID to ReEnroll Config File"
-    state_set "ComputerSiteID" "$computerSiteID"
     infoOut "Computer Site Name: $computerSite"
-    infoOut "Adding computer site to ReEnroll Config File"
-    state_set "ComputerSite" "$computerSite"
+    if [[ "${persistSite}" != "true" ]]; then
+        infoOut "Keeping the computer site recorded in the ReEnroll Config File"
+    elif [[ -z "${computerSiteID}" ]]; then
+        warning "Jamf Pro returned no site ID; keeping the computer site recorded in the ReEnroll Config File"
+    else
+        infoOut "Adding computer site ID and site to ReEnroll Config File"
+        state_set "ComputerSiteID" "$computerSiteID"
+        state_set "ComputerSite" "$computerSite"
+    fi
     infoOut "Computer Model: $computerModel"
 
     if [[ "$debugMode" = "verbose" ]]; then
@@ -313,6 +322,11 @@ function redeployJamfFramework() {
     redeployResult="${JAMF_HTTP_BODY}"
     check_status "${JAMF_HTTP_STATUS}"
     state_set "ReEnrollMethod" "Redeploy Jamf Framework"
+    if [ "$APIResult" != "Failure" ]; then
+        # Recorded as soon as Jamf Pro accepts the command, before the device
+        # installs the framework and submits the enrollment's inventory.
+        enrollDeviceReceipt "Jamf Pro accepted the framework redeploy (HTTP ${JAMF_HTTP_STATUS})"
+    fi
 
     if [ "$displayReEnrollDialog" = "true" ]; then
         if [ "$APIResult" = "Failure" ]; then
@@ -476,6 +490,30 @@ function jssConnectionStatus() {
     esac
 }
 
+# Appends the jamf.log bytes written since the byte offset stored in
+# marker_file to duplicate_jamfLogFile, then stores the new offset. Only the
+# new bytes are read: jamf.log is not rotated, can be tens of MB, and
+# validatePolicy polls it up to 120 times. Exactly the bytes present when the
+# size was read are copied, so a line Jamf is still writing is picked up whole
+# by the next call. A log shorter than the offset was replaced or truncated
+# and is read from its start. Returns 1 when jamf.log cannot be read.
+function copyNewJamfLogEntries() {
+    local offset="" logSize=""
+
+    [[ -f "${marker_file}" ]] && offset="$(<"${marker_file}")"
+    [[ "${offset}" == <-> ]] || offset=0
+    logSize="$(/usr/bin/stat -f '%z' "${jamfLogFile}" 2>/dev/null)"
+    [[ "${logSize}" == <-> ]] || return 1
+    (( logSize < offset )) && offset=0
+
+    if (( logSize > offset )); then
+        /usr/bin/tail -c "+$(( offset + 1 ))" "${jamfLogFile}" \
+            | /usr/bin/head -c "$(( logSize - offset ))" >> "${duplicate_jamfLogFile}"
+    fi
+    lastPosition="${logSize}"
+    print -r -- "${lastPosition}" > "${marker_file}"
+}
+
 function validatePolicy() {
     if isDryRun; then
         policyStatus="yes"
@@ -484,29 +522,23 @@ function validatePolicy() {
         return 0
     fi
 
-    jamfLogFile="/var/log/jamf.log"
+    jamfLogFile="${jamfLogFile:-/var/log/jamf.log}"
     duplicate_jamfLogFile="$duplicate_log_dir/jamf_position_$timestamp.log"
 
     if [[ -z "${marker_file}" || ! -f "${marker_file}" ]]; then
         createMarkerFile
     fi
 
-    if [ -f "$marker_file" ]; then
-        lastPosition=$(cat "$marker_file")
-    else
-        lastPosition=0
+    if ! copyNewJamfLogEntries && [[ "$debugMode" = "verbose" ]]; then
+        debugVerbose "Unable to read ${jamfLogFile}"
     fi
-
-    tail -n +$((lastPosition + 1)) "$jamfLogFile" >> "$duplicate_jamfLogFile"
-    wc -l "$jamfLogFile" | awk '{print $1}' > "$marker_file"
-
-    lastPosition=$(cat "$marker_file")
     if [[ "$debugMode" = "verbose" ]]; then
         debugVerbose "Last jamf.log position: $lastPosition"
     fi
 
-    policyStatus=$(tail -n1 "$duplicate_jamfLogFile" | awk -F': ' '{print $NF}' | sed -e 's/Removing existing launchd task \/Library\/LaunchDaemons\/com.jamfsoftware.task.bgrecon.plist... //g')
-    currentPolicyStatus=$(tail -n1 "$duplicate_jamfLogFile" | awk -F': ' '{print $NF}' | sed -e 's/Removing existing launchd task \/Library\/LaunchDaemons\/com.jamfsoftware.task.bgrecon.plist... //g')
+    # The status is the last field of the newest copied line, read once.
+    currentPolicyStatus=$(/usr/bin/tail -n 1 "$duplicate_jamfLogFile" 2>/dev/null | /usr/bin/awk -F': ' '{print $NF}' | /usr/bin/sed -e 's/Removing existing launchd task \/Library\/LaunchDaemons\/com.jamfsoftware.task.bgrecon.plist... //g')
+    policyStatus="${currentPolicyStatus}"
 
     if [ "$redeployFramework" = "false" ] || [ "$sendEnrollmentInvitation" = "false" ] || [ "$renewProfiles" = "false" ]; then
         case "${policyStatus}" in
@@ -553,6 +585,18 @@ function validateInventory() {
      Unknown Error - An unknown error has occurred" ) inventoryStatus="connection error" ;;
         * ) inventoryStatus="unknown" ;;
     esac
+}
+
+# Prints the username for "jamf recon -endUsername", or nothing. Only the
+# directory (NetworkUser) name of a Jamf Connect or mobile account is used.
+# An empty value can blank the User and Location username on the Jamf computer
+# record, and a local short name may not match the directory account, so for
+# ordinary local accounts the argument is omitted and the record left as is.
+function reconEndUsername() {
+    local user="${networkUser:-}"
+    user="${user%%$'\n'*}"
+    [[ -n "${user//[[:space:]]/}" ]] || return 0
+    print -r -- "${user}"
 }
 
 function triggerEnrollment() {

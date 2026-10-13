@@ -124,7 +124,7 @@ function dialogCheck() {
         swiftDialogMinimumRequiredVersion="2.5.2"
     fi
 
-    if [ ! -e "/Library/Application Support/Dialog/Dialog.app" ]; then
+    if [ ! -e "${dialogAppPath:-/Library/Application Support/Dialog/Dialog.app}" ]; then
         preFlight "swiftDialog not found. Installing..."
         dialogInstall
     else

@@ -22,6 +22,9 @@ scriptLog="$folder_path/ReEnroll.log"
 reEnrollConfigFile="$folder_path/ReEnroll.plist"
 # Cleanup guard
 cleanupHasRun="false"
+# Longest a temporary admin grant to the console user may last before the
+# admin guard LaunchDaemon revokes it, even if the run is still going
+adminGrantMaxSeconds="3600"
 scriptDirectory="$(cd -- "$(dirname -- "$0")" && pwd -P)"
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
@@ -57,7 +60,10 @@ lapsAdminAccount="${6:-}"                                             # [ add th
 skipAccountDeletion="false"                                         # [ false (default) | true ]
 # Define the exempt user list from being deleted (Add the username in quotes, with a space in between each)
 exempt_users=("Shared" "Guest" "$loggedInUser")                     # [ add the exempt user list here ]
-# Define the targeted user list to be deleted (Add the username in quotes, with a space in between each) 
+# Define the targeted user list to be deleted (Add the username in quotes, with a space in between each)
+# A targeted account is deleted only when its UID is above 500, it is not the console user or exempt,
+# and it is not an administrator. Its home folder is removed only when it is a real directory directly
+# under /Users (not Shared, not a symlink) owned by that account; otherwise it is left in place.
 targeted_users=("$lapsAdminAccount" "anotherAccount" )              # [ add the targeted user list here ]
 # Jamf Enrollment Invitation ID (https:/company.jamfcloud.com/enroll?invitation=1542270881__;!!KwNVnq) (Invitation ID in this example would be: 1542270881)
 enrollmentInvitation="${7:-}"                                        # [ add the Invitation ID here ]
@@ -118,6 +124,9 @@ fi
 timestamp=$(date +"%Y-%m-%d %I:%M:%S %p %Z")
 # Dialog Binary
 dialogBinary="/usr/local/bin/dialog"
+# swiftDialog application bundle; its presence selects the swiftDialog
+# workflow on macOS 12 and later (otherwise osascript is used)
+dialogAppPath="/Library/Application Support/Dialog/Dialog.app"
 dialogPid=""
 caffeinatePid=""
 # Dialog temporary command files
@@ -517,7 +526,7 @@ function dialogCheck() {
         swiftDialogMinimumRequiredVersion="2.5.2"
     fi
 
-    if [ ! -e "/Library/Application Support/Dialog/Dialog.app" ]; then
+    if [ ! -e "${dialogAppPath:-/Library/Application Support/Dialog/Dialog.app}" ]; then
         preFlight "swiftDialog not found. Installing..."
         dialogInstall
     else
@@ -902,7 +911,11 @@ function computerIDLookup() {
     fi
 }
 
+# Pass "false" to read the live site without saving it over the site that
+# ReEnroll recorded before redeployment (updatedComputerInventoryInfo).
 function computerInventoryInfo() {
+    local persistSite="${1:-true}"
+
     computerName="$(get_json_path "${inventoryDetailJson}" "general.name" 2>/dev/null || true)"
     computerSerialNumber="$(get_json_path "${inventoryDetailJson}" "hardware.serialNumber" 2>/dev/null || true)"
     computerModel="$(get_json_path "${inventoryDetailJson}" "hardware.model" 2>/dev/null || true)"
@@ -912,11 +925,16 @@ function computerInventoryInfo() {
     computerSiteID="$(get_json_path "${inventoryDetailJson}" "general.site.id" 2>/dev/null || true)"
 
     infoOut "Computer Site ID: $computerSiteID"
-    infoOut "Adding computer site ID to ReEnroll Config File"
-    state_set "ComputerSiteID" "$computerSiteID"
     infoOut "Computer Site Name: $computerSite"
-    infoOut "Adding computer site to ReEnroll Config File"
-    state_set "ComputerSite" "$computerSite"
+    if [[ "${persistSite}" != "true" ]]; then
+        infoOut "Keeping the computer site recorded in the ReEnroll Config File"
+    elif [[ -z "${computerSiteID}" ]]; then
+        warning "Jamf Pro returned no site ID; keeping the computer site recorded in the ReEnroll Config File"
+    else
+        infoOut "Adding computer site ID and site to ReEnroll Config File"
+        state_set "ComputerSiteID" "$computerSiteID"
+        state_set "ComputerSite" "$computerSite"
+    fi
     infoOut "Computer Model: $computerModel"
 
     if [[ "$debugMode" = "verbose" ]]; then
@@ -987,6 +1005,11 @@ function redeployJamfFramework() {
     redeployResult="${JAMF_HTTP_BODY}"
     check_status "${JAMF_HTTP_STATUS}"
     state_set "ReEnrollMethod" "Redeploy Jamf Framework"
+    if [ "$APIResult" != "Failure" ]; then
+        # Recorded as soon as Jamf Pro accepts the command, before the device
+        # installs the framework and submits the enrollment's inventory.
+        enrollDeviceReceipt "Jamf Pro accepted the framework redeploy (HTTP ${JAMF_HTTP_STATUS})"
+    fi
 
     if [ "$displayReEnrollDialog" = "true" ]; then
         if [ "$APIResult" = "Failure" ]; then
@@ -1150,6 +1173,30 @@ function jssConnectionStatus() {
     esac
 }
 
+# Appends the jamf.log bytes written since the byte offset stored in
+# marker_file to duplicate_jamfLogFile, then stores the new offset. Only the
+# new bytes are read: jamf.log is not rotated, can be tens of MB, and
+# validatePolicy polls it up to 120 times. Exactly the bytes present when the
+# size was read are copied, so a line Jamf is still writing is picked up whole
+# by the next call. A log shorter than the offset was replaced or truncated
+# and is read from its start. Returns 1 when jamf.log cannot be read.
+function copyNewJamfLogEntries() {
+    local offset="" logSize=""
+
+    [[ -f "${marker_file}" ]] && offset="$(<"${marker_file}")"
+    [[ "${offset}" == <-> ]] || offset=0
+    logSize="$(/usr/bin/stat -f '%z' "${jamfLogFile}" 2>/dev/null)"
+    [[ "${logSize}" == <-> ]] || return 1
+    (( logSize < offset )) && offset=0
+
+    if (( logSize > offset )); then
+        /usr/bin/tail -c "+$(( offset + 1 ))" "${jamfLogFile}" \
+            | /usr/bin/head -c "$(( logSize - offset ))" >> "${duplicate_jamfLogFile}"
+    fi
+    lastPosition="${logSize}"
+    print -r -- "${lastPosition}" > "${marker_file}"
+}
+
 function validatePolicy() {
     if isDryRun; then
         policyStatus="yes"
@@ -1158,29 +1205,23 @@ function validatePolicy() {
         return 0
     fi
 
-    jamfLogFile="/var/log/jamf.log"
+    jamfLogFile="${jamfLogFile:-/var/log/jamf.log}"
     duplicate_jamfLogFile="$duplicate_log_dir/jamf_position_$timestamp.log"
 
     if [[ -z "${marker_file}" || ! -f "${marker_file}" ]]; then
         createMarkerFile
     fi
 
-    if [ -f "$marker_file" ]; then
-        lastPosition=$(cat "$marker_file")
-    else
-        lastPosition=0
+    if ! copyNewJamfLogEntries && [[ "$debugMode" = "verbose" ]]; then
+        debugVerbose "Unable to read ${jamfLogFile}"
     fi
-
-    tail -n +$((lastPosition + 1)) "$jamfLogFile" >> "$duplicate_jamfLogFile"
-    wc -l "$jamfLogFile" | awk '{print $1}' > "$marker_file"
-
-    lastPosition=$(cat "$marker_file")
     if [[ "$debugMode" = "verbose" ]]; then
         debugVerbose "Last jamf.log position: $lastPosition"
     fi
 
-    policyStatus=$(tail -n1 "$duplicate_jamfLogFile" | awk -F': ' '{print $NF}' | sed -e 's/Removing existing launchd task \/Library\/LaunchDaemons\/com.jamfsoftware.task.bgrecon.plist... //g')
-    currentPolicyStatus=$(tail -n1 "$duplicate_jamfLogFile" | awk -F': ' '{print $NF}' | sed -e 's/Removing existing launchd task \/Library\/LaunchDaemons\/com.jamfsoftware.task.bgrecon.plist... //g')
+    # The status is the last field of the newest copied line, read once.
+    currentPolicyStatus=$(/usr/bin/tail -n 1 "$duplicate_jamfLogFile" 2>/dev/null | /usr/bin/awk -F': ' '{print $NF}' | /usr/bin/sed -e 's/Removing existing launchd task \/Library\/LaunchDaemons\/com.jamfsoftware.task.bgrecon.plist... //g')
+    policyStatus="${currentPolicyStatus}"
 
     if [ "$redeployFramework" = "false" ] || [ "$sendEnrollmentInvitation" = "false" ] || [ "$renewProfiles" = "false" ]; then
         case "${policyStatus}" in
@@ -1229,6 +1270,18 @@ function validateInventory() {
     esac
 }
 
+# Prints the username for "jamf recon -endUsername", or nothing. Only the
+# directory (NetworkUser) name of a Jamf Connect or mobile account is used.
+# An empty value can blank the User and Location username on the Jamf computer
+# record, and a local short name may not match the directory account, so for
+# ordinary local accounts the argument is omitted and the record left as is.
+function reconEndUsername() {
+    local user="${networkUser:-}"
+    user="${user%%$'\n'*}"
+    [[ -n "${user//[[:space:]]/}" ]] || return 0
+    print -r -- "${user}"
+}
+
 function triggerEnrollment() {
     if isDryRun; then
         dryRunOut "Would prompt enrollment renewal for uid ${uid}"
@@ -1240,6 +1293,110 @@ function triggerEnrollment() {
 }
 # END INLINED MODULE: jamf_api.zsh
 # BEGIN INLINED MODULE: launchd.zsh
+
+# Directory for the admin guard LaunchDaemon property list.
+reenrollLaunchDaemonDirectory="/Library/LaunchDaemons"
+
+# Prints the jamf-recon.zsh script that the recon LaunchDaemon runs. Values
+# that come from the account (the network user) are shell-quoted so they stay
+# literal arguments in the generated root script.
+function printReconDaemonScript() {
+    local rotatePasswordCommand reconUser reconCommand reconLogMessage
+
+    if [ "$sendEnrollmentInvitation" = "true" ]; then
+        rotatePasswordCommand='echo "$(date +"%Y-%m-%d %H:%M:%S") - [RECON DAEMON] Attempting to rotate Management Account Password" >> "'"$scriptLog"'"
+    /usr/local/bin/jamf policy -event rotateManagementAccountPassword
+    rotateStatus=$?
+    if [ $rotateStatus -eq 0 ]; then
+        echo "$(date +"%Y-%m-%d %H:%M:%S") - [RECON DAEMON] Successfully sent rotate password command" >> "'"$scriptLog"'"
+    else
+        echo "$(date +"%Y-%m-%d %H:%M:%S") - [RECON DAEMON] Error sending rotate password command (exit code: $rotateStatus)" >> "'"$scriptLog"'"
+    fi'
+    else
+        rotatePasswordCommand='echo "$(date +"%Y-%m-%d %H:%M:%S") - [RECON DAEMON] Management Account Password will not be rotated" >> "'"$scriptLog"'"'
+    fi
+    rotatePasswordCommand="${rotatePasswordCommand//\/usr\/local\/bin\/jamf/${jamfBinary}}"
+
+    # Never pass an empty -endUsername: it can blank the User and Location
+    # username on the Jamf computer record.
+    reconUser="$(reconEndUsername)"
+    if [[ -n "${reconUser}" ]]; then
+        reconCommand="${(qq)jamfBinary} recon -endUsername ${(qq)reconUser}"
+        reconLogMessage="Running Jamf recon for user: ${reconUser}"
+    else
+        reconCommand="${(qq)jamfBinary} recon"
+        reconLogMessage="Running Jamf recon without -endUsername (no network user)"
+    fi
+
+    cat << EOF
+#!/bin/zsh --no-rcs
+
+RECON_LOG="$scriptLog"
+
+log_message() {
+    echo "\$(date +"%Y-%m-%d %H:%M:%S") - [RECON DAEMON] \$1" >> "\$RECON_LOG"
+}
+
+clear_admin_grant() {
+    for key in ReEnrollPromotedUser ReEnrollPromotedPID ReEnrollPromotedAt; do
+        /usr/bin/defaults delete "$reEnrollConfigFile" "\$key" >/dev/null 2>&1
+    done
+}
+
+log_message "=== Recon LaunchDaemon Started ==="
+
+log_message ${(qq)reconLogMessage}
+${reconCommand} >> "\$RECON_LOG" 2>&1
+reconStatus=\$?
+if [ \$reconStatus -eq 0 ]; then
+    log_message "Jamf recon completed successfully"
+else
+    log_message "Jamf recon failed with exit code: \$reconStatus"
+fi
+
+log_message "Running Jamf policy"
+${(qq)jamfBinary} policy >> "\$RECON_LOG" 2>&1
+policyStatus=\$?
+if [ \$policyStatus -eq 0 ]; then
+    log_message "Jamf policy completed successfully"
+else
+    log_message "Jamf policy failed with exit code: \$policyStatus"
+fi
+
+$rotatePasswordCommand
+
+log_message "Checking admin status for user: $loggedInUser"
+# Only demote an account that ReEnroll itself promoted (recorded by addAdmin);
+# a user who was already an administrator keeps their rights.
+promotedUser="\$(/usr/bin/defaults read "$reEnrollConfigFile" ReEnrollPromotedUser 2>/dev/null)"
+if [ -z "$loggedInUser" ] || [ "\$promotedUser" != "$loggedInUser" ]; then
+    log_message "ReEnroll did not promote $loggedInUser; leaving admin membership unchanged"
+elif /usr/sbin/dseditgroup -o checkmember -m "$loggedInUser" admin | /usr/bin/grep -q "is a member"; then
+    log_message "$loggedInUser was promoted by ReEnroll. Removing from the admin group..."
+    /usr/sbin/dseditgroup -o edit -d "$loggedInUser" -t user admin
+    if [ \$? -eq 0 ]; then
+        log_message "$loggedInUser has been removed from the admin group"
+        clear_admin_grant
+    else
+        log_message "Failed to remove $loggedInUser from admin group"
+    fi
+else
+    log_message "$loggedInUser is not an admin"
+    clear_admin_grant
+fi
+
+log_message "Cleaning up LaunchDaemon files"
+
+/bin/rm "/Library/$organizationName/jamf-recon.zsh"
+/bin/rmdir "/Library/$organizationName" 2>/dev/null
+/bin/rm "/Library/LaunchDaemons/$organizationReverseDomain.jamf-recon.plist"
+/bin/launchctl remove "$organizationReverseDomain.jamf-recon"
+
+log_message "=== Recon LaunchDaemon Completed ==="
+
+exit 0
+EOF
+}
 
 function reconLaunchDaemon() {
     if isDryRun; then
@@ -1266,82 +1423,7 @@ function reconLaunchDaemon() {
 
     /bin/mkdir -p "/Library/$organizationName"
 
-    if [ "$sendEnrollmentInvitation" = "true" ]; then
-        rotatePasswordCommand='echo "$(date +"%Y-%m-%d %H:%M:%S") - [RECON DAEMON] Attempting to rotate Management Account Password" >> "'"$scriptLog"'"
-    /usr/local/bin/jamf policy -event rotateManagementAccountPassword
-    rotateStatus=$?
-    if [ $rotateStatus -eq 0 ]; then
-        echo "$(date +"%Y-%m-%d %H:%M:%S") - [RECON DAEMON] Successfully sent rotate password command" >> "'"$scriptLog"'"
-    else
-        echo "$(date +"%Y-%m-%d %H:%M:%S") - [RECON DAEMON] Error sending rotate password command (exit code: $rotateStatus)" >> "'"$scriptLog"'"
-    fi'
-    else
-        rotatePasswordCommand='echo "$(date +"%Y-%m-%d %H:%M:%S") - [RECON DAEMON] Management Account Password will not be rotated" >> "'"$scriptLog"'"'
-    fi
-    rotatePasswordCommand="${rotatePasswordCommand//\/usr\/local\/bin\/jamf/${jamfBinary}}"
-
-    tee "/Library/$organizationName/jamf-recon.zsh" << EOF
-#!/bin/zsh --no-rcs
-
-RECON_LOG="$scriptLog"
-
-log_message() {
-    echo "\$(date +"%Y-%m-%d %H:%M:%S") - [RECON DAEMON] \$1" >> "\$RECON_LOG"
-}
-
-log_message "=== Recon LaunchDaemon Started ==="
-
-log_message "Running Jamf recon for user: $networkUser"
-"${jamfBinary}" recon -endUsername "$networkUser" >> "\$RECON_LOG" 2>&1
-reconStatus=\$?
-if [ \$reconStatus -eq 0 ]; then
-    log_message "Jamf recon completed successfully"
-else
-    log_message "Jamf recon failed with exit code: \$reconStatus"
-fi
-
-log_message "Running Jamf policy"
-"${jamfBinary}" policy >> "\$RECON_LOG" 2>&1
-policyStatus=\$?
-if [ \$policyStatus -eq 0 ]; then
-    log_message "Jamf policy completed successfully"
-else
-    log_message "Jamf policy failed with exit code: \$policyStatus"
-fi
-
-$rotatePasswordCommand
-
-log_message "Checking admin status for user: $loggedInUser"
-# Only demote an account that ReEnroll itself promoted (recorded by addAdmin);
-# a user who was already an administrator keeps their rights.
-promotedUser="\$(/usr/bin/defaults read "$reEnrollConfigFile" ReEnrollPromotedUser 2>/dev/null)"
-if [ -z "$loggedInUser" ] || [ "\$promotedUser" != "$loggedInUser" ]; then
-    log_message "ReEnroll did not promote $loggedInUser; leaving admin membership unchanged"
-elif /usr/sbin/dseditgroup -o checkmember -m "$loggedInUser" admin | /usr/bin/grep -q "is a member"; then
-    log_message "$loggedInUser was promoted by ReEnroll. Removing from the admin group..."
-    /usr/sbin/dseditgroup -o edit -d "$loggedInUser" -t user admin
-    if [ \$? -eq 0 ]; then
-        log_message "$loggedInUser has been removed from the admin group"
-        /usr/bin/defaults delete "$reEnrollConfigFile" ReEnrollPromotedUser >/dev/null 2>&1
-    else
-        log_message "Failed to remove $loggedInUser from admin group"
-    fi
-else
-    log_message "$loggedInUser is not an admin"
-    /usr/bin/defaults delete "$reEnrollConfigFile" ReEnrollPromotedUser >/dev/null 2>&1
-fi
-
-log_message "Cleaning up LaunchDaemon files"
-
-/bin/rm "/Library/$organizationName/jamf-recon.zsh"
-/bin/rmdir "/Library/$organizationName" 2>/dev/null
-/bin/rm "/Library/LaunchDaemons/$organizationReverseDomain.jamf-recon.plist"
-/bin/launchctl remove "$organizationReverseDomain.jamf-recon"
-
-log_message "=== Recon LaunchDaemon Completed ==="
-
-exit 0
-EOF
+    printReconDaemonScript | tee "/Library/$organizationName/jamf-recon.zsh"
 
     /usr/sbin/chown root:wheel "/Library/$organizationName/jamf-recon.zsh" && /bin/chmod +x "/Library/$organizationName/jamf-recon.zsh"
 
@@ -1379,14 +1461,215 @@ EOF
     /bin/launchctl bootstrap system "/Library/LaunchDaemons/$organizationReverseDomain.jamf-recon.plist" && \
         /bin/launchctl kickstart -k "system/$organizationReverseDomain.jamf-recon"
 }
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Admin guard LaunchDaemon
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+# addAdmin records a temporary admin grant (ReEnrollPromotedUser, ...PID and
+# ...At in the ReEnroll plist) and arms this guard before promoting the console
+# user. The guard runs at load, at every boot and every minute. While the run
+# that made the grant is still running (same boot, process alive, younger than
+# adminGrantMaxSeconds) it does nothing. Once that run has ended without
+# revoking the grant (killed, timed out or a restart), it demotes the recorded
+# user, clears the record and removes itself. Only recorded users are demoted,
+# so an account that was already an administrator is never touched.
+
+function adminGuardLabel() {
+    print -r -- "${organizationReverseDomain}.reenroll-admin-guard"
+}
+
+function adminGuardScriptPath() {
+    print -r -- "${folder_path}/ReEnrollAdminGuard.zsh"
+}
+
+function xmlEscape() {
+    local value="$1"
+    value="${value//"&"/&amp;}"
+    value="${value//"<"/&lt;}"
+    value="${value//">"/&gt;}"
+    print -r -- "${value}"
+}
+
+function writeAdminGuardScript() {
+    local scriptPath="$1" label="$2" plistPath="$3"
+    local maxSeconds="${adminGrantMaxSeconds:-3600}"
+    [[ "${maxSeconds}" == <1-> ]] || maxSeconds=3600
+
+    {
+        print -r -- '#!/bin/zsh --no-rcs'
+        print -r -- '# Generated by ReEnroll (lib/launchd.zsh): revokes the admin rights ReEnroll'
+        print -r -- '# granted once the run that granted them has ended, then removes itself.'
+        print -r -- "configFile=${(qq)reEnrollConfigFile}"
+        print -r -- "logFile=${(qq)scriptLog}"
+        print -r -- "guardLabel=${(qq)label}"
+        print -r -- "guardPlist=${(qq)plistPath}"
+        print -r -- "guardScript=${(qq)scriptPath}"
+        print -r -- "maxGrantSeconds=${maxSeconds}"
+        cat << 'EOF'
+
+function log_message() {
+    print -r -- "$(/bin/date +"%Y-%m-%d %H:%M:%S") - [ADMIN GUARD] $1" >> "${logFile}"
+}
+
+function remove_guard() {
+    /bin/rm -f -- "${guardPlist}" "${guardScript}"
+    /bin/launchctl bootout "system/${guardLabel}" >/dev/null 2>&1
+}
+
+function clear_grant() {
+    local key
+    for key in ReEnrollPromotedUser ReEnrollPromotedPID ReEnrollPromotedAt; do
+        /usr/bin/defaults delete "${configFile}" "${key}" >/dev/null 2>&1
+    done
+}
+
+promotedUser="$(/usr/bin/defaults read "${configFile}" ReEnrollPromotedUser 2>/dev/null)"
+if [[ -z "${promotedUser}" ]]; then
+    log_message "No temporary admin grant is recorded; removing the admin guard"
+    remove_guard
+    exit 0
+fi
+
+# The granting run is still active when this boot began before the grant,
+# its process is alive and the grant is younger than the limit.
+promotedPID="$(/usr/bin/defaults read "${configFile}" ReEnrollPromotedPID 2>/dev/null)"
+promotedAt="$(/usr/bin/defaults read "${configFile}" ReEnrollPromotedAt 2>/dev/null)"
+bootTime="$(/usr/sbin/sysctl -n kern.boottime 2>/dev/null)"
+bootTime="${${bootTime#*sec = }%%,*}"
+now="$(/bin/date +%s)"
+if [[ "${promotedPID}" == <2-> && "${promotedAt}" == <1-> && "${bootTime}" == <1-> && "${now}" == <1-> ]] \
+    && (( bootTime <= promotedAt && now - promotedAt < maxGrantSeconds )) \
+    && kill -0 "${promotedPID}" 2>/dev/null; then
+    exit 0
+fi
+
+if /usr/sbin/dseditgroup -o checkmember -m "${promotedUser}" admin 2>/dev/null | /usr/bin/grep -q "is a member"; then
+    if ! /usr/sbin/dseditgroup -o edit -d "${promotedUser}" -t user admin >/dev/null 2>&1; then
+        log_message "Failed to remove ${promotedUser} from the admin group; retrying in a minute"
+        exit 1
+    fi
+    log_message "Removed ${promotedUser} from the admin group; the ReEnroll run that granted it has ended"
+else
+    log_message "${promotedUser} is no longer an administrator"
+fi
+clear_grant
+remove_guard
+exit 0
+EOF
+    } > "${scriptPath}"
+}
+
+function installAdminGuardDaemon() {
+    if isDryRun; then
+        dryRunOut "Would install and bootstrap the admin guard LaunchDaemon"
+        return 0
+    fi
+
+    local label scriptPath plistPath
+    label="$(adminGuardLabel)"
+    scriptPath="$(adminGuardScriptPath)"
+    plistPath="${reenrollLaunchDaemonDirectory}/${label}.plist"
+
+    # Replace a guard left by an earlier run; the script reads the current record.
+    /bin/launchctl bootout "system/${label}" >/dev/null 2>&1 || true
+
+    writeAdminGuardScript "${scriptPath}" "${label}" "${plistPath}" || return 1
+    /usr/sbin/chown root:wheel "${scriptPath}" && /bin/chmod 700 "${scriptPath}" || return 1
+
+    cat > "${plistPath}" << EOF || return 1
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+<key>Label</key>
+<string>$(xmlEscape "${label}")</string>
+<key>ProgramArguments</key>
+<array>
+<string>/bin/zsh</string>
+<string>--no-rcs</string>
+<string>$(xmlEscape "${scriptPath}")</string>
+</array>
+<key>RunAtLoad</key>
+<true/>
+<key>StartInterval</key>
+<integer>60</integer>
+</dict>
+</plist>
+EOF
+
+    /usr/sbin/chown root:wheel "${plistPath}" && /bin/chmod 644 "${plistPath}" || return 1
+    /bin/launchctl bootstrap system "${plistPath}" || return 1
+    infoOut "Armed the admin guard LaunchDaemon (${label})"
+}
+
+function removeAdminGuardDaemon() {
+    if isDryRun; then
+        dryRunOut "Would remove the admin guard LaunchDaemon"
+        return 0
+    fi
+
+    local label
+    label="$(adminGuardLabel)"
+    /bin/rm -f -- "${reenrollLaunchDaemonDirectory}/${label}.plist" "$(adminGuardScriptPath)"
+    /bin/launchctl bootout "system/${label}" >/dev/null 2>&1 || true
+}
 # END INLINED MODULE: launchd.zsh
 # BEGIN INLINED MODULE: webhooks.zsh
+
+# Escapes a value for use inside a JSON string literal: backslash, double
+# quote and every control character. Computer names and the full name from
+# "id -F" are end-user controlled, so a raw value could break the payload or
+# inject extra Slack blocks or Teams card actions.
+function jsonEscape() {
+    emulate -L zsh
+    local value="$1" char escapedChar
+    local -i code
+
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\n'/\\n}"
+    value="${value//$'\r'/\\r}"
+    value="${value//$'\t'/\\t}"
+    value="${value//$'\b'/\\b}"
+    value="${value//$'\f'/\\f}"
+    for code in {1..31}; do
+        char="${(#)code}"
+        [[ "${value}" == *"${char}"* ]] || continue
+        printf -v escapedChar '\\u%04x' "${code}"
+        value="${value//${char}/${escapedChar}}"
+    done
+    print -r -- "${value}"
+}
+
+# Slack mrkdwn treats &, < and > as control characters (<!channel>, links).
+function slackEscape() {
+    local value="$1"
+    value="${value//"&"/&amp;}"
+    value="${value//"<"/&lt;}"
+    value="${value//">"/&gt;}"
+    print -r -- "${value}"
+}
+
+# A value for a Slack mrkdwn field inside the JSON payload.
+function slackField() {
+    jsonEscape "$(slackEscape "$1")"
+}
 
 function webHookMessage() {
     if isDryRun; then
         dryRunOut "Would send webhook notifications to configured Slack and Teams destinations"
         return 0
     fi
+
+    local webhookUser slackPayload jsonPayload
+
+    if [[ -z "$client_id" || -z "$client_secret" ]] || [ "$APIAccess" = "Failure" ]; then
+        webhookComputerModel="$modelName"
+    else
+        webhookComputerModel="$computerModel"
+    fi
+    webhookUser="$loggedInUserFirstname $loggedInUserLastname (User ID: $loggedInUser)"
 
     if [[ -z "$slackURL" ]]; then
         infoOut "No slack URL configured"
@@ -1395,24 +1678,14 @@ function webHookMessage() {
             supportTeamHyperlink="https://www.slack.com"
         fi
 
-        if [[ -z "$client_id" || -z "$client_secret" ]] || [ "$APIAccess" = "Failure" ]; then
-            webhookComputerModel="$modelName"
-        else
-            webhookComputerModel="$computerModel"
-        fi
-
         infoOut "Sending Slack WebHook"
-        if ! /usr/bin/curl --silent --show-error --fail \
-            --connect-timeout 10 --max-time 30 \
-            --request POST --header 'Content-type: application/json' \
-            -d \
-            '{
+        slackPayload='{
     "blocks": [
         {
             "type": "header",
             "text": {
                 "type": "plain_text",
-                "text": "'${scriptName}': '"${webhookStatus}"'"
+                "text": "'"$(jsonEscape "${scriptName}: ${webhookStatus}")"'"
             }
         },
         {
@@ -1423,27 +1696,27 @@ function webHookMessage() {
             "fields": [
                 {
                     "type": "mrkdwn",
-                    "text": ">*Serial Number and Computer Name:*\n>'"$serialNumber"' on '"$computerName"'"
+                    "text": ">*Serial Number and Computer Name:*\n>'"$(slackField "$serialNumber on $computerName")"'"
                 },
                 {
                     "type": "mrkdwn",
-                    "text": ">*Computer Model:*\n>'"$webhookComputerModel"'"
+                    "text": ">*Computer Model:*\n>'"$(slackField "$webhookComputerModel")"'"
                 },
                 {
                     "type": "mrkdwn",
-                    "text": ">*Current User:*\n>'"$loggedInUserFirstname $loggedInUserLastname (User ID: $loggedInUser)"'"
+                    "text": ">*Current User:*\n>'"$(slackField "$webhookUser")"'"
                 },
                 {
                     "type": "mrkdwn",
-                    "text": ">*Notification Status:*\n>'"$webhookStatus"'"
+                    "text": ">*Notification Status:*\n>'"$(slackField "$webhookStatus")"'"
                 },
                 {
                     "type": "mrkdwn",
-                    "text": ">*ReEnrollment Method:*\n>'"$reEnrollMethod"'"
+                    "text": ">*ReEnrollment Method:*\n>'"$(slackField "$reEnrollMethod")"'"
                 },
                 {
                     "type": "mrkdwn",
-                    "text": ">*Computer Record:*\n>'"$jamfProComputerURL"'"
+                    "text": ">*Computer Record:*\n>'"$(slackField "$jamfProComputerURL")"'"
                 }
             ]
         },
@@ -1459,12 +1732,17 @@ function webHookMessage() {
                     },
                     "style": "primary",
                     "action_id": "actionId-0",
-                    "url": "'"$jamfProComputerURL"'"
+                    "url": "'"$(jsonEscape "$jamfProComputerURL")"'"
                 }
             ]
         }
     ]
-}' \
+}'
+
+        if ! /usr/bin/curl --silent --show-error --fail \
+            --connect-timeout 10 --max-time 30 \
+            --request POST --header 'Content-type: application/json' \
+            -d "$slackPayload" \
             "$slackURL"; then
             warning "Slack webhook delivery failed."
         fi
@@ -1477,39 +1755,33 @@ function webHookMessage() {
             supportTeamHyperlink="https://www.microsoft.com/en-us/microsoft-teams/"
         fi
 
-        if [[ -z "$client_id" || -z "$client_secret" ]] || [ "$APIAccess" = "Failure" ]; then
-            webhookComputerModel="$modelName"
-        else
-            webhookComputerModel="$computerModel"
-        fi
-
         infoOut "Sending Teams WebHook"
         jsonPayload='{
     "@type": "AdaptiveCard",
     "@context": "http://schema.org/extensions",
     "themeColor": "0076D7",
-    "summary": "'${scriptName}': '${webhookStatus}'",
+    "summary": "'"$(jsonEscape "${scriptName}: ${webhookStatus}")"'",
     "sections": [{
-        "activityTitle": "'${scriptName}': '${webhookStatus}'",
+        "activityTitle": "'"$(jsonEscape "${scriptName}: ${webhookStatus}")"'",
         "activityImage": "https://raw.githubusercontent.com/AndrewMBarnett/ReEnroll/refs/heads/main/Extras/Images/systemSettings.png",
         "facts": [{
             "name": "Computer Name (Serial Number):",
-            "value": "'"$computerName"' ('"$serialNumber"')"
+            "value": "'"$(jsonEscape "$computerName ($serialNumber)")"'"
         }, {
             "name": "Computer Model:",
-            "value": "'"$webhookComputerModel"'"
+            "value": "'"$(jsonEscape "$webhookComputerModel")"'"
         }, {
             "name": "Current User:",
-            "value": "'"$loggedInUserFirstname $loggedInUserLastname (User ID: $loggedInUser)"'"
+            "value": "'"$(jsonEscape "$webhookUser")"'"
         }, {
             "name": "Notification Status:",
-            "value": "'"$webhookStatus"'"
+            "value": "'"$(jsonEscape "$webhookStatus")"'"
         }, {
             "name": "ReEnrollment Method:",
-            "value": "'"$reEnrollMethod"'"
+            "value": "'"$(jsonEscape "$reEnrollMethod")"'"
         }, {
             "name": "Computer Record:",
-            "value": "'"$jamfProComputerURL"'"
+            "value": "'"$(jsonEscape "$jamfProComputerURL")"'"
         }],
         "markdown": true
     }],
@@ -1519,7 +1791,7 @@ function webHookMessage() {
         "targets": [{
             "os": "default",
             "uri":
-            "'"$jamfProComputerURL"'"
+            "'"$(jsonEscape "$jamfProComputerURL")"'"
         }]
     }]
 }'
@@ -1535,6 +1807,85 @@ function webHookMessage() {
 # END INLINED MODULE: webhooks.zsh
 # BEGIN INLINED MODULE: laps.zsh
 
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Local account safety checks
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+# Account names reach dscl as /Users/<name>, so only plain short names are
+# accepted; a name such as "../Groups/admin" must never reach a delete.
+reenrollLocalAccountNamePattern='^[A-Za-z0-9_][A-Za-z0-9._-]*$'
+
+# Prints the first value of a local user record attribute. Reading the plist
+# form keeps values that contain spaces (such as a home folder path) intact.
+function localAccountAttribute() {
+    /usr/bin/dscl -plist . -read "/Users/${1}" "${2}" 2>/dev/null \
+        | /usr/bin/plutil -extract "dsAttrTypeStandard:${2}.0" raw -o - - 2>/dev/null
+}
+
+# Decides whether ReEnroll may delete or demote a local account. Returns 0
+# when it may, 2 when no such account exists and 1 when it must not:
+# an invalid name, a system account (UID below 500), the console user or an
+# account in exempt_users. Sets removableAccountUID and accountRemovalReason.
+# A mistyped Jamf parameter $6 or targeted_users entry is refused here.
+function localAccountRemovable() {
+    local account="$1"
+    local consoleUser exemptUser
+
+    removableAccountUID=""
+    accountRemovalReason=""
+
+    if [[ ! "${account}" =~ ${reenrollLocalAccountNamePattern} ]]; then
+        accountRemovalReason="'${account}' is not a valid local account name"
+        return 1
+    fi
+
+    removableAccountUID="$(localAccountAttribute "${account}" UniqueID)" || removableAccountUID=""
+    if [[ -z "${removableAccountUID}" ]]; then
+        accountRemovalReason="no local account named ${account} exists"
+        return 2
+    fi
+    if [[ "${removableAccountUID}" != <-> ]]; then
+        accountRemovalReason="${account} has an unreadable UID (${removableAccountUID})"
+        return 1
+    fi
+    if (( removableAccountUID < 500 )); then
+        accountRemovalReason="${account} has UID ${removableAccountUID}; accounts below UID 500 are system accounts"
+        return 1
+    fi
+
+    consoleUser="$(liveConsoleUser)" || consoleUser=""
+    if [[ "${account}" == "${loggedInUser:-}" || "${account}" == "${consoleUser}" ]]; then
+        accountRemovalReason="${account} is the console user"
+        return 1
+    fi
+
+    for exemptUser in "${exempt_users[@]}"; do
+        if [[ -n "${exemptUser}" && "${account}" == "${exemptUser}" ]]; then
+            accountRemovalReason="${account} is in exempt_users"
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+# Returns 0 when the account is in the admin group, 1 when dseditgroup reports
+# it is not, and 2 when membership cannot be determined. Callers treat 2 as
+# "leave the account alone".
+function localAccountIsAdmin() {
+    local membership
+
+    membership="$(/usr/sbin/dseditgroup -o checkmember -m "${1}" admin 2>&1)" || true
+    case "${membership}" in
+        "yes "*) return 0 ;;
+        "no "*) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+# Deletes the Jamf-managed LAPS account named by Jamf parameter $6 so the
+# enrollment that follows recreates it. The account must pass
+# localAccountRemovable; the home folder is left in place.
 function deleteLAPSAccount() {
     if isDryRun; then
         dryRunOut "Would delete the LAPS account '${lapsAdminAccount}' if present"
@@ -1543,12 +1894,31 @@ function deleteLAPSAccount() {
 
     if [ "$skipAccountDeletion" = "false" ]; then
         notice "Skip Account Deletion is set to false, proceeding"
-        if [ -n "$lapsAdminAccount" ]; then
-            notice "Deleting LAPS account: ${lapsAdminAccount}"
-            /usr/bin/dscl . -delete /Users/"$lapsAdminAccount"
-        else
+        if [ -z "$lapsAdminAccount" ]; then
             notice "No LAPS account to delete"
+            return 0
         fi
+
+        local removable=0
+        localAccountRemovable "${lapsAdminAccount}" || removable=$?
+        case ${removable} in
+            0) ;;
+            2)
+                notice "LAPS account ${lapsAdminAccount} does not exist; nothing to delete"
+                return 0
+                ;;
+            *)
+                error "Not deleting LAPS account ${lapsAdminAccount}: ${accountRemovalReason}"
+                return 1
+                ;;
+        esac
+
+        notice "Deleting LAPS account: ${lapsAdminAccount} (UID ${removableAccountUID})"
+        if ! /usr/bin/dscl . -delete "/Users/${lapsAdminAccount}"; then
+            error "Unable to delete LAPS account ${lapsAdminAccount}"
+            return 1
+        fi
+        infoOut "Deleted LAPS account ${lapsAdminAccount}"
     elif [ "$skipAccountDeletion" = "" ]; then
         infoOut "Skip Account Deletion is set blank, skipping"
     else
@@ -1702,6 +2072,11 @@ function rotateLAPSPassword() {
     fi
     "${jamfBinary}" rotateManagementAccountPassword
 
+    # Jamf Pro needs time to escrow the new password before a check can pass.
+    # This is the only up-front wait; verifyLAPSCredentials checks at once.
+    infoOut "Waiting 60 seconds for Jamf Pro to escrow the rotated LAPS password"
+    sleep 60
+
     verifyLAPSCredentials
 }
 
@@ -1720,25 +2095,31 @@ function verifyLAPSCredentials() {
     # loop's bound, and the enrollment invitation is sent at most once per
     # run: each invitation deletes the LAPS account, re-enrolls and rotates
     # the password, so repeating it on every failed check looped forever.
+    # The first check runs at once, so a valid account costs no wait; the 60
+    # second pause is only between a failed check and the next one (at most
+    # two checks per call). rotateLAPSPassword waits for escrow itself.
     local LAPScounter=1
-    lap_Status=1
-    until [[ "$lap_Status" -eq 0 ]] || [[ "$LAPScounter" -gt 2 ]]; do
-        scriptResult+="Check ${LAPScounter} of 2: LAPS account not valid; waiting to re-check; "
-        sleep 60
-        checkLAPSAccount "$jssurl" "$management_id" "$apiBearerToken" "$lapsAdminAccount" "$lapsPassword"
-        lap_Status=$?
+    checkLAPSAccount "$jssurl" "$management_id" "$apiBearerToken" "$lapsAdminAccount" "$lapsPassword"
+    lap_Status=$?
 
-        if [[ "$lap_Status" -ne 0 ]]; then
-            if [[ "${lapsReEnrollInvitationSent:-false}" == "true" ]]; then
-                warning "LAPS credentials are still invalid after the enrollment invitation; not sending another"
-            else
-                lapsReEnrollInvitationSent="true"
-                notice "Sending enrollment invitation..."
-                reEnrollInvitation
-            fi
+    while [[ "$lap_Status" -ne 0 ]]; do
+        if [[ "${lapsReEnrollInvitationSent:-false}" == "true" ]]; then
+            warning "LAPS credentials are still invalid after the enrollment invitation; not sending another"
+        else
+            lapsReEnrollInvitationSent="true"
+            notice "Sending enrollment invitation..."
+            reEnrollInvitation
+            # The invitation's own verification sets lap_Status; stop if it
+            # already confirmed the new credentials.
+            [[ "$lap_Status" -eq 0 ]] && break
         fi
 
-        ((LAPScounter++))
+        (( LAPScounter >= 2 )) && break
+        scriptResult+="Check ${LAPScounter} of 2: LAPS account not valid; waiting to re-check; "
+        sleep 60
+        (( LAPScounter++ ))
+        checkLAPSAccount "$jssurl" "$management_id" "$apiBearerToken" "$lapsAdminAccount" "$lapsPassword"
+        lap_Status=$?
     done
 }
 
@@ -1786,6 +2167,7 @@ function checkLAPSAccountStatus() {
         updateDialog "listitem: title: Sending Enrollment Invitation, icon: SF=person.crop.circle.fill.badge.checkmark,weight=bold, statustext: Invitation Sent, status: success"
         state_set "ReEnrollNotificationStatus" "No Notification"
         webhookStatus="ReEnroll without notification"
+        enrollDeviceReceipt "the Jamf-managed LAPS credentials were verified"
 
         if [[ -z "$reEnrollMethod" ]]; then
             reEnrollMethod="Silent Redeploy of the Jamf Management Framework"
@@ -1810,9 +2192,28 @@ function checkLAPSAccountStatus() {
 # END INLINED MODULE: laps.zsh
 # BEGIN INLINED MODULE: enrollment.zsh
 
+# Records DeviceEnrolledStatus "Enrolled Device" (read by the "Device ReEnroll
+# Status" extension attribute and the smart groups built on it). Called only
+# once this run has evidence of enrollment: Jamf Pro accepted the framework
+# redeploy, jamf enroll accepted the invitation, the console user accepted
+# the enrollment renewal, or the Jamf check-in or LAPS credentials were
+# verified. A run that fails before any of these leaves the earlier value.
+# The accepted-action cases record before the enrollment's own inventory, so
+# the smart-group exclusion applies to the policies that enrollment triggers.
 function enrollDeviceReceipt() {
-    infoOut "Adding device enrolled receipt"
+    local reason="${1:-enrollment was verified}"
+
+    if isDryRun; then
+        dryRunOut "Would record the device enrolled receipt because ${reason}"
+        return 0
+    fi
+    if [[ "${deviceEnrolledReceiptRecorded:-false}" == "true" ]]; then
+        return 0
+    fi
+
+    infoOut "Adding device enrolled receipt: ${reason}"
     state_set "DeviceEnrolledStatus" "Enrolled Device"
+    deviceEnrolledReceiptRecorded="true"
 }
 
 # Called only from failure paths (check-in, inventory and LAPS validation
@@ -1872,7 +2273,7 @@ function inventoryError() {
     webhookStatus="ReEnroll with notification"
     reEnrollMethod="Notification for Renewing Enrollment"
 
-    if [[ "${osMajorVersion}" -ge 12 ]] && [[ -e "/Library/Application Support/Dialog/Dialog.app" ]]; then
+    if [[ "${osMajorVersion}" -ge 12 ]] && [[ -e "${dialogAppPath:-/Library/Application Support/Dialog/Dialog.app}" ]]; then
         infoOut "Sending Dialog notification for updating profiles"
         jamfProfileRenew
 
@@ -1889,7 +2290,11 @@ function inventoryError() {
                 infoOut "Checking user admin status to renew profiles"
                 addAdmin
                 sleep 5
-                triggerEnrollment
+                if triggerEnrollment; then
+                    enrollDeviceReceipt "${loggedInUser:-the console user} accepted the enrollment renewal"
+                else
+                    warning "Unable to start the enrollment renewal for ${loggedInUser:-the console user}; not recording the device as enrolled."
+                fi
                 deleteLAPSAccount
                 updateDialog "listitem: title: Jamf Update Needed, icon: SF=arrow.clockwise.icloud.fill,weight=bold, statustext: Update Pending, status: pending"
                 updateDialog "progresstext: Update command sent. Waiting for response..."
@@ -1974,6 +2379,7 @@ function reEnrollInvitation() {
         if [ -n "$lapsAdminAccount" ]; then
             deleteLAPSAccount
         fi
+        enrollDeviceReceipt "jamf enroll accepted the enrollment invitation"
         rotateLAPSPassword
         return 0
     fi
@@ -1981,34 +2387,101 @@ function reEnrollInvitation() {
     if [ "$enrollmentInvitation" = "" ] || [ "$sendEnrollmentInvitation" = "false" ]; then
         error "Enrollment invitation is empty, not sending invitation"
         updateDialog "The enrollment invitation is empty or incorrect, unable to send invitation"
-    else
-        infoOut "Send Enrollment Invitation is set to true and enrollment invitation is not empty"
-        updateDialog "listitem: add, title: Sending Enrollment Invitation, icon: SF=paperplane.circle.fill,weight=bold, statustext: Sending …, status: wait"
-        updateDialog "listitem: delete, title: ReEnroll in progress …,"
-        updateDialog "progresstext: Sending Enrollment Invitation..."
-
-        if [ "$lapsAdminAccount" = "" ]; then
-            notice "LAPS Admin Account is empty, not deleting LAPS account"
-        else
-            infoOut "Deleting ${lapsAdminAccount}"
-            deleteLAPSAccount
-        fi
-
-        infoOut "Sending Silent Enrollment Invitation"
-        if [[ -z "${jamfBinary}" || ! -x "${jamfBinary}" ]]; then
-            error "The Jamf binary is unavailable; the enrollment invitation cannot be sent locally."
-            return 1
-        fi
-        "${jamfBinary}" enroll -invitation "$enrollmentInvitation" -noRecon -noPolicy
-        updateDialog "listitem: title: Sending Enrollment Invitation, icon: SF=person.crop.circle.fill.badge.checkmark,weight=bold, statustext: Invitation Sent, status: success"
-        updateDialog "progresstext: Enrollment Invitation Sent"
-        state_set "ReEnrollMethod" "Enrollment Invitation"
-
-        reEnrollMethod="Sending Silent Enrollment Invitation"
-        webhookStatus="ReEnroll without notification"
-
-        rotateLAPSPassword
+        return 1
     fi
+
+    # Check the Jamf binary before anything destructive: the LAPS account is
+    # deleted below and only a successful enrollment recreates it. The
+    # framework redeploy earlier in this run may have installed the binary.
+    if [[ -z "${jamfBinary:-}" || ! -x "${jamfBinary}" ]]; then
+        jamfBinary="$(findJamfBinary || true)"
+    fi
+    if [[ -z "${jamfBinary}" || ! -x "${jamfBinary}" ]]; then
+        error "The Jamf binary is unavailable; the enrollment invitation cannot be sent locally. The LAPS account was left in place."
+        return 1
+    fi
+
+    infoOut "Send Enrollment Invitation is set to true and enrollment invitation is not empty"
+    updateDialog "listitem: add, title: Sending Enrollment Invitation, icon: SF=paperplane.circle.fill,weight=bold, statustext: Sending …, status: wait"
+    updateDialog "listitem: delete, title: ReEnroll in progress …,"
+    updateDialog "progresstext: Sending Enrollment Invitation..."
+
+    if [ "$lapsAdminAccount" = "" ]; then
+        notice "LAPS Admin Account is empty, not deleting LAPS account"
+    else
+        infoOut "Deleting ${lapsAdminAccount}"
+        deleteLAPSAccount
+    fi
+
+    infoOut "Sending Silent Enrollment Invitation"
+    local enrollExit
+    "${jamfBinary}" enroll -invitation "$enrollmentInvitation" -noRecon -noPolicy
+    enrollExit=$?
+    if (( enrollExit != 0 )); then
+        # Record nothing and skip the LAPS rotation: there is no new
+        # enrollment for the plist, extension attribute or webhook to report.
+        error "The enrollment invitation failed (jamf enroll exit ${enrollExit}); not recording it or rotating the LAPS password."
+        updateDialog "listitem: title: Sending Enrollment Invitation, icon: SF=exclamationmark.icloud.fill,weight=bold, statustext: Invitation Failed, status: fail"
+        updateDialog "progresstext: Enrollment Invitation failed"
+        reEnrollMethod="Silent Enrollment Invitation failed"
+        return 1
+    fi
+
+    updateDialog "listitem: title: Sending Enrollment Invitation, icon: SF=person.crop.circle.fill.badge.checkmark,weight=bold, statustext: Invitation Sent, status: success"
+    updateDialog "progresstext: Enrollment Invitation Sent"
+    state_set "ReEnrollMethod" "Enrollment Invitation"
+    enrollDeviceReceipt "jamf enroll accepted the enrollment invitation"
+
+    reEnrollMethod="Sending Silent Enrollment Invitation"
+    webhookStatus="ReEnroll without notification"
+
+    rotateLAPSPassword
+}
+
+# Prints the PIDs of this script's ancestors, nearest first. The jamf process
+# that runs this policy is one of them.
+function reenrollAncestorPids() {
+    local pid="$$" parent
+    local -i depth=0
+    while [[ "${pid}" == <2-> ]] && (( depth++ < 64 )); do
+        parent="$(/bin/ps -o ppid= -p "${pid}" 2>/dev/null)"
+        parent="${parent//[[:space:]]/}"
+        [[ "${parent}" == <1-> ]] || break
+        print -r -- "${parent}"
+        pid="${parent}"
+    done
+}
+
+# Stops the enrollment check-in that the framework redeploy or invitation
+# started, so inventory can be submitted without waiting for every
+# enrollmentComplete policy. A plain "pkill jamf" also killed the jamf process
+# running this policy (aborting its log upload), the jamf launch daemon and
+# unrelated policy runs, so only non-ancestor jamf processes whose arguments
+# show an enrollment run are signalled.
+function terminateEnrollmentCheckIn() {
+    local pid args
+    local -a ancestors jamfPids
+
+    ancestors=( ${(f)"$(reenrollAncestorPids)"} )
+    jamfPids=( ${(f)"$(/usr/bin/pgrep -x jamf 2>/dev/null)"} )
+
+    for pid in "${jamfPids[@]}"; do
+        [[ "${pid}" == <1-> ]] || continue
+        if (( ${ancestors[(Ie)${pid}]} )); then
+            infoOut "Leaving jamf process ${pid} running; it is running this policy"
+            continue
+        fi
+        args="$(/bin/ps -o args= -p "${pid}" 2>/dev/null)"
+        case "${args}" in
+            *" enroll"|*" enroll "*|*enrollmentComplete*)
+                infoOut "Terminating enrollment check-in (jamf process ${pid})"
+                kill "${pid}" 2>/dev/null || warning "Unable to terminate jamf process ${pid}"
+                ;;
+            *)
+                infoOut "Leaving unrelated jamf process ${pid} running"
+                ;;
+        esac
+    done
 }
 
 function checkIn() {
@@ -2067,13 +2540,15 @@ function checkIn() {
         if [[ "${policyStatus}" = "yes" ]]; then
             infoOut "Jamf Pro Policy Connection is stable, proceeding"
             updateDialog "listitem: title: • Policy Status, icon: SF=icloud.and.arrow.up.fill,weight=bold, statustext: Connected, status: success"
+            # Before the recon below, so the inventory it submits carries it.
+            enrollDeviceReceipt "the Jamf Pro policy check-in was verified"
         else
             error "Unable to verify Jamf Pro Policy Check In, proceeding"
             updateDialog "listitem: title: • Policy Status, icon: SF=exclamationmark.icloud.fill, statustext: Unable to Verify, status: error"
         fi
 
         infoOut "Terminating Jamf Check-In"
-        pkill jamf
+        terminateEnrollmentCheckIn
 
         sleep 5
         updateDialog "listitem: title: Jamf Connection Status, icon: SF=icloud.and.arrow.up.fill,weight=bold, statustext: Check 3 of 3, status: wait"
@@ -2086,7 +2561,16 @@ function checkIn() {
             inventoryStatus="not installed"
             return 1
         fi
-        "${jamfBinary}" recon -endUsername "${networkUser}" --verbose >> "${tempInventoryLog}"
+        local reconUser
+        local -a reconArgs
+        reconArgs=(recon)
+        reconUser="$(reconEndUsername)"
+        if [[ -n "${reconUser}" ]]; then
+            reconArgs+=(-endUsername "${reconUser}")
+        else
+            notice "No network user for ${loggedInUser:-the console user}; submitting inventory without -endUsername"
+        fi
+        "${jamfBinary}" "${reconArgs[@]}" --verbose >> "${tempInventoryLog}"
 
         validateInventory
         counterInventory=1
@@ -2125,20 +2609,28 @@ function checkIn() {
     fi
 }
 
+# Restores the site recorded before redeployment (originalComputerSiteID, read
+# from the ReEnroll plist). computerSiteID holds the live site and is used only
+# for the log, so a site changed by redeployment is put back.
 function computerSiteUpdate() {
     if isDryRun; then
-        dryRunOut "Would update the computer back to its original Jamf site ID '${computerSiteID}'"
+        dryRunOut "Would update the computer back to its original Jamf site ID '${originalComputerSiteID}'"
         return 0
     fi
 
-    infoOut "Computer has an original Site: ($originalComputerSite), site ID: ($originalComputerSiteID)"
+    if [[ "${originalComputerSiteID}" != <1-> || "${computerID}" != <1-> ]]; then
+        error "Cannot restore the original Jamf site: site ID '${originalComputerSiteID}', computer ID '${computerID}'."
+        return 1
+    fi
+
+    infoOut "Computer has an original Site: ($originalComputerSite), site ID: ($originalComputerSiteID); current site ID: (${computerSiteID})"
     if ! jamfApiRequest PATCH "${jssurl}api/${jamfInventoryApiVersion}/computers-inventory-detail/${computerID}" \
         --header "Authorization: Bearer $apiBearerToken" \
         --header 'accept: application/json' \
         --header 'Content-Type: application/json' \
         --data "{
         \"general\": {
-            \"siteId\": \"$computerSiteID\"
+            \"siteId\": \"$originalComputerSiteID\"
         }
         }"; then
         error "Unable to restore the original Jamf site (HTTP ${JAMF_HTTP_STATUS})."
@@ -2188,16 +2680,27 @@ function updatedComputerInventoryInfo() {
         infoOut "Update computer site is set to true, verifying and updating computer Site"
         getAccessToken
         checkTokenExpiration
-        apiResponse
-        computerIDLookup
-        computerInventoryInfo
+        # Without a fresh lookup computerID and the inventory are empty or
+        # stale; stop instead of PATCHing a missing ID.
+        if ! apiResponse || ! computerIDLookup; then
+            error "Unable to look up this computer in Jamf Pro; not updating its site."
+            quitScript
+            return 1
+        fi
+        # Read the live site without replacing the original recorded before
+        # redeployment, so a failed restore leaves the original in the plist.
+        computerInventoryInfo "false"
         if [ ! "$newComputerSiteID" = "" ]; then
-            newComputerSiteUpdate
-            notice "New Computer Site ID: $newComputerSiteID"
-        elif [ "$originalComputerSiteID" -gt "1" ]; then
-            computerSiteUpdate
-            notice "The computer ($serialNumber) was updated to the original site ($originalComputerSite)."
-        elif [ "$originalComputerSiteID" -lt "0" ]; then
+            if newComputerSiteUpdate; then
+                notice "New Computer Site ID: $newComputerSiteID"
+            fi
+        elif [[ "$originalComputerSiteID" == <1-> ]]; then
+            if [[ "$computerSiteID" == "$originalComputerSiteID" ]]; then
+                notice "The computer ($serialNumber) is already in its original site ($originalComputerSite)."
+            elif computerSiteUpdate; then
+                notice "The computer ($serialNumber) was updated to the original site ($originalComputerSite)."
+            fi
+        elif [[ "$originalComputerSiteID" == -<1-> ]]; then
             notice "The computer ($serialNumber) Site was set to none."
         else
             error "The computer was not updated to the original site"
@@ -2350,30 +2853,27 @@ function createLastLogPosition() {
     duplicate_jamfLogFile="$duplicate_log_dir/jamf_position_$timestamp.log"
     preFlight "Duplicate Log File location: $duplicate_jamfLogFile"
 
-    # Find the last position marker or start from the beginning if not found
-    if [[ -f "$marker_file" && -f $jamfLogFile ]]; then
-        lastPosition=$(cat "$marker_file")
-    else 
+    # The marker file holds a byte offset into jamf.log; an empty or missing
+    # marker starts from the beginning of the log.
+    if [[ ! -f $jamfLogFile ]]; then
         preFlight "Creating jamf log file and setting error position as zero"
         touch "$jamfLogFile"
         chmod 755 "$jamfLogFile"
-        lastPosition=0
+        print -r -- "0" > "$marker_file"
     fi
 
-    # Copy new entries from jamf.log to the duplicate log file
+    # Copy new entries from jamf.log to the duplicate log file and record the
+    # new byte offset in the marker file (copyNewJamfLogEntries, jamf_api.zsh)
     if [ -f "$jamfLogFile" ]; then
-        tail -n +$((lastPosition + 1)) "$jamfLogFile" > "$duplicate_jamfLogFile"
-        preFlight "jamf log file exists. Tailing new entries from log file to duplicate log file" 
-    else 
+        : > "$duplicate_jamfLogFile"
+        copyNewJamfLogEntries || error "Unable to read the jamf log file"
+        preFlight "jamf log file exists. Copied new entries from log file to duplicate log file"
+    else
         error "jamf log file not found"
     fi
-
-    # Update the marker file with the new position
-    wc -l "$jamfLogFile" | awk '{print $1}' > "$marker_file"
     preFlight "Updating marker file"
 
     # Echo out the last position on the marker file
-    lastPosition=$(cat "$marker_file")
     preFlight "Last position of marker file: $lastPosition"
 }
 
@@ -2429,24 +2929,51 @@ fi
 # Pre-flight Check: Confirm Dock is running / user is at Desktop
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
+# The account that owns the console right now ("root" at the login window).
+function liveConsoleUser() {
+    /usr/bin/stat -f '%Su' /dev/console 2>/dev/null
+}
+
+# Waits up to dockFinderChecks checks, 2 seconds apart, for Finder and Dock.
+# Only the swiftDialog progress UI ($8 true) needs a desktop: without it, a
+# run at the login window continues at once and a desktop that never appears
+# is logged as a warning, so recurring and enrollment policies stay unattended.
 function dockCheck() {
+    local dockFinderChecks=10
+    local check consoleUser
 
     preFlight "Checking if Finder & Dock are running"
 
-    DockFinderCounter="1"
-
-    until [[ "${DockFinderCounter}" -gt "10" ]] || (pgrep -q -x "Finder" && pgrep -q -x "Dock"); do
-    preFlight "Finder & Dock are NOT running; pausing for 1 second"
-        sleep 2
-        ((DockFinderCounter++))
-
-        if [[ "${DockFinderCounter}" -gt "10" ]] || ! pgrep -q -x "Finder" || ! pgrep -q -x "Dock"; then
-            error "Finder or Dock not found or timeout reached; exiting"
-            quitScript 1
-        else
+    for (( check = 1; check <= dockFinderChecks; check++ )); do
+        if /usr/bin/pgrep -q -x "Finder" && /usr/bin/pgrep -q -x "Dock"; then
             preFlight "Finder & Dock are running; proceeding"
+            return 0
+        fi
+
+        if [[ "${displayReEnrollDialog}" != "true" ]]; then
+            consoleUser="$(liveConsoleUser)" || consoleUser=""
+            case "${consoleUser}" in
+                ""|root|loginwindow|_mbsetupuser)
+                    preFlight "No user is logged in at the desktop (console: ${consoleUser:-none}); continuing unattended"
+                    return 0
+                    ;;
+            esac
+        fi
+
+        if (( check < dockFinderChecks )); then
+            preFlight "Finder & Dock are NOT running (check ${check} of ${dockFinderChecks}); pausing for 2 seconds"
+            sleep 2
         fi
     done
+
+    if [[ "${displayReEnrollDialog}" == "true" ]]; then
+        error "Finder or Dock is still not running after ${dockFinderChecks} checks; the ReEnroll dialog needs a logged-in desktop; exiting"
+        quitScript 1
+        return 1
+    fi
+
+    warning "Finder or Dock is still not running after ${dockFinderChecks} checks; continuing unattended"
+    return 0
 }
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
@@ -2620,8 +3147,9 @@ function cleanupTemporaryArtifacts() {
 }
 
 # Any renew path (renewProfiles true or the default "failure") can promote the
-# console user. removeAdmin acts only on the account recorded by addAdmin, so
-# it is always safe to call here.
+# console user. removeAdmin acts only on a grant addAdmin recorded in this run,
+# so it is always safe to call here. A run that never reaches this trap is
+# covered by the admin guard LaunchDaemon and the next run's startup check.
 function cleanupPrivileges() {
     infoOut "Removing any admin access granted by ReEnroll"
     removeAdmin
@@ -2724,6 +3252,10 @@ function state_set_date() {
     /usr/bin/defaults write "${reEnrollConfigFile}" "${1}" -date "${2}"
 }
 
+function state_delete() {
+    /usr/bin/defaults delete "${reEnrollConfigFile}" "${1}" >/dev/null 2>&1 || true
+}
+
 # Create Property List
 function propertyList() {
     local stateFileExists="false"
@@ -2760,6 +3292,10 @@ function propertyList() {
 function runInitialChecks() {
     propertyList
     rootCheck
+    # Before dockCheck, which exits when the progress dialog is requested and
+    # no GUI session is ready, so even such a run revokes rights left by a
+    # run that was killed.
+    revokeStaleAdminGrant
     dockCheck
 }
 
@@ -2798,16 +3334,100 @@ function addAdmin() {
     if dseditgroup -o checkmember -m "$loggedInUser" admin | grep -qi "not a member"; then
         infoOut "${loggedInUser} is not an admin. Adding to the admin group..."
         updateDialog "progresstext: Adding ${loggedInUser} to the admin group..."
-        /usr/sbin/dseditgroup -o edit -a "$loggedInUser" -t user admin
-        # Record the temporary grant so removeAdmin and the recon daemon demote
-        # only an account ReEnroll promoted, never a pre-existing administrator.
-        state_set "ReEnrollPromotedUser" "$loggedInUser"
+        # Record the temporary grant and arm the admin guard LaunchDaemon
+        # before promoting, so the grant is revoked even if this run is killed,
+        # times out or the Mac restarts before the EXIT trap demotes. Only a
+        # recorded account is ever demoted, never a pre-existing administrator.
+        recordAdminGrant "$loggedInUser"
+        if ! installAdminGuardDaemon; then
+            error "Unable to arm the admin guard LaunchDaemon; not granting ${loggedInUser} admin rights."
+            revokeAdminGrant "$loggedInUser"
+            return 1
+        fi
+        if ! /usr/sbin/dseditgroup -o edit -a "$loggedInUser" -t user admin; then
+            error "Unable to add ${loggedInUser} to the admin group."
+            revokeAdminGrant "$loggedInUser"
+            return 1
+        fi
         infoOut "${loggedInUser} has been added to the admin group."
         updateDialog "progresstext: ${loggedInUser} has been added to the admin group."
     else
         infoOut "${loggedInUser} is already an admin."
         updateDialog "progresstext: ${loggedInUser} is already an admin."
     fi
+}
+
+# The grant record: who was promoted, by which ReEnroll process, and when.
+function recordAdminGrant() {
+    state_set "ReEnrollPromotedUser" "$1"
+    state_set "ReEnrollPromotedPID" "${reEnrollPID}"
+    state_set "ReEnrollPromotedAt" "$(/bin/date +%s)"
+}
+
+function clearAdminGrantRecord() {
+    state_delete "ReEnrollPromotedUser"
+    state_delete "ReEnrollPromotedPID"
+    state_delete "ReEnrollPromotedAt"
+}
+
+# Succeeds while another ReEnroll run that recorded the grant is still going:
+# this boot began before the grant, its process is alive and the grant is
+# younger than adminGrantMaxSeconds. The admin guard applies the same test.
+function adminGrantRunActive() {
+    local promotedPID promotedAt bootTime now
+
+    promotedPID="$(state_get "ReEnrollPromotedPID")"
+    promotedAt="$(state_get "ReEnrollPromotedAt")"
+    [[ "${promotedPID}" == <2-> && "${promotedAt}" == <1-> ]] || return 1
+    [[ "${promotedPID}" != "${reEnrollPID}" ]] || return 1
+    bootTime="$(/usr/sbin/sysctl -n kern.boottime 2>/dev/null)"
+    bootTime="${${bootTime#*sec = }%%,*}"
+    now="$(/bin/date +%s)"
+    [[ "${bootTime}" == <1-> && "${now}" == <1-> ]] || return 1
+    (( bootTime <= promotedAt && now - promotedAt < ${adminGrantMaxSeconds:-3600} )) || return 1
+    kill -0 "${promotedPID}" 2>/dev/null
+}
+
+# Demotes an account ReEnroll recorded as promoted. The record and the admin
+# guard are removed only once the account is no longer an administrator, so a
+# failed demotion is retried by the guard.
+function revokeAdminGrant() {
+    local promotedUser="$1"
+
+    if dseditgroup -o checkmember -m "${promotedUser}" admin | grep -q "is a member"; then
+        infoOut "${promotedUser} was promoted by ReEnroll. Removing from the admin group..."
+        if ! /usr/sbin/dseditgroup -o edit -d "${promotedUser}" -t user admin; then
+            error "Unable to remove ${promotedUser} from the admin group; the admin guard LaunchDaemon will retry."
+            return 1
+        fi
+        infoOut "${promotedUser} has been removed from the admin group."
+    else
+        infoOut "${promotedUser} is not an admin."
+    fi
+    clearAdminGrantRecord
+    removeAdminGuardDaemon
+}
+
+# Startup: revoke a grant left by an earlier run that was killed, timed out or
+# interrupted by a restart, whatever renewProfiles is set to.
+function revokeStaleAdminGrant() {
+    local promotedUser
+
+    promotedUser="$(state_get "ReEnrollPromotedUser")"
+    [[ -n "${promotedUser}" ]] || return 0
+
+    if isDryRun; then
+        dryRunOut "Would remove the admin rights an earlier ReEnroll run granted to ${promotedUser}"
+        return 0
+    fi
+
+    if adminGrantRunActive; then
+        notice "Another ReEnroll run that granted ${promotedUser} admin rights is still running; leaving the grant to that run and the admin guard."
+        return 0
+    fi
+
+    warning "An earlier ReEnroll run granted ${promotedUser} admin rights and did not remove them; removing them now."
+    revokeAdminGrant "${promotedUser}"
 }
 
 
@@ -2822,24 +3442,121 @@ function removeAdmin () {
         return 0
     fi
 
-    if [[ -z "$loggedInUser" || "$(state_get "ReEnrollPromotedUser")" != "$loggedInUser" ]]; then
-        quitOut "ReEnroll did not grant admin rights to ${loggedInUser:-the console user}; leaving group membership unchanged."
+    # Act only on a grant this run recorded; one left by another run is
+    # handled by that run, the admin guard or the next run's startup check.
+    if [[ -z "$loggedInUser" || "$(state_get "ReEnrollPromotedUser")" != "$loggedInUser" \
+        || "$(state_get "ReEnrollPromotedPID")" != "${reEnrollPID}" ]]; then
+        quitOut "ReEnroll did not grant admin rights to ${loggedInUser:-the console user} in this run; leaving group membership unchanged."
         return 0
     fi
 
-    if dseditgroup -o checkmember -m "$loggedInUser" admin | grep -q "is a member"; then
-        quitOut "$loggedInUser was promoted by ReEnroll. Removing from the admin group..."
-        /usr/sbin/dseditgroup -o edit -d "$loggedInUser" -t user admin
-        quitOut "$loggedInUser has been removed from the admin group."
-    else
-        quitOut "$loggedInUser is not an admin."
-    fi
-    /usr/bin/defaults delete "${reEnrollConfigFile}" "ReEnrollPromotedUser" >/dev/null 2>&1 || true
+    revokeAdminGrant "$loggedInUser"
 }
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 # Find User Accounts and Remove
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+# Home folders that account cleanup may remove live directly in this folder.
+userHomeRoot="/Users"
+
+# Sets removableHomeDirectory to the account's home folder when it is safe to
+# remove as root: a real directory (not a symlink, no symlinked or ".."
+# component) directly under userHomeRoot, not Shared, and owned by the
+# account's UID. Otherwise clears it, sets homeRemovalReason and fails.
+function checkRemovableHomeDirectory() {
+    local account="$1"
+    local accountUID="$2"
+    local home folderName homeOwner
+
+    removableHomeDirectory=""
+    homeRemovalReason=""
+
+    home="$(localAccountAttribute "${account}" NFSHomeDirectory)" || home=""
+    folderName="${home#"${userHomeRoot}"/}"
+    if [[ -z "${home}" ]]; then
+        homeRemovalReason="the account record has no home folder"
+        return 1
+    fi
+    if [[ "${home}" != "${userHomeRoot}"/* || "${folderName}" == */* \
+        || "${folderName}" == (|.|..|Shared) ]]; then
+        homeRemovalReason="${home} is not a user folder directly under ${userHomeRoot}"
+        return 1
+    fi
+    if [[ ! -e "${home}" && ! -L "${home}" ]]; then
+        homeRemovalReason="${home} does not exist"
+        return 1
+    fi
+    if [[ -L "${home}" || ! -d "${home}" ]]; then
+        homeRemovalReason="${home} is not a real directory"
+        return 1
+    fi
+    if [[ "${home:A}" != "${home}" ]]; then
+        homeRemovalReason="${home} resolves to ${home:A}"
+        return 1
+    fi
+    homeOwner="$(/usr/bin/stat -f '%u' "${home}" 2>/dev/null)" || homeOwner=""
+    if [[ "${homeOwner}" != "${accountUID}" ]]; then
+        homeRemovalReason="${home} is owned by UID ${homeOwner:-unknown}, not ${account} (UID ${accountUID})"
+        return 1
+    fi
+
+    removableHomeDirectory="${home}"
+}
+
+# Deletes one targeted account (already checked against exempt_users) and its
+# home folder. Refuses an invalid name, a UID of 500 or below, the console
+# user and administrators, including when admin membership cannot be read.
+function removeTargetedAccount() {
+    local user="$1"
+    local removable=0 admin_status=0
+
+    localAccountRemovable "$user" || removable=$?
+    case ${removable} in
+        0) ;;
+        2)
+            notice "User $user no longer exists; nothing to remove"
+            return 0
+            ;;
+        *)
+            warning "Not removing $user: ${accountRemovalReason}"
+            return 1
+            ;;
+    esac
+    if (( removableAccountUID <= 500 )); then
+        warning "Not removing $user: UID ${removableAccountUID} is not above 500"
+        return 1
+    fi
+
+    localAccountIsAdmin "$user" || admin_status=$?
+    case ${admin_status} in
+        0)
+            infoOut "User $user was found to be a Local Admin, ignoring..."
+            return 0
+            ;;
+        1) ;;
+        *)
+            warning "Unable to determine whether $user is a Local Admin; leaving the account in place"
+            return 1
+            ;;
+    esac
+
+    # Read the home folder before the record that names it is deleted.
+    checkRemovableHomeDirectory "$user" "$removableAccountUID" || true
+
+    infoOut "Found user $user in targeted list, deleting the account..."
+    if ! /usr/bin/dscl . -delete "/Users/$user"; then
+        error "Unable to delete user $user; leaving its home folder in place"
+        return 1
+    fi
+
+    if [[ -n "${removableHomeDirectory}" ]]; then
+        infoOut "Deleting ${removableHomeDirectory} for $user"
+        /bin/rm -rf -- "${removableHomeDirectory}" || error "Unable to delete ${removableHomeDirectory}"
+    else
+        warning "Leaving the home folder of $user in place: ${homeRemovalReason}"
+    fi
+}
 
 # Find User Accounts and Remove
 function findUsersandRemove() {
@@ -2868,47 +3585,52 @@ function findUsersandRemove() {
         error "lapsAdminAccount is empty"
     fi
 
-    # Demote LAPS admin account to be removed
-    infoOut "Demoting $lapsAdminAccount account"
-
-/usr/sbin/dseditgroup -o edit -d "$lapsAdminAccount" -t user admin
-
-RESULT=()
-
-# Read the list of users with UniqueID greater than 500
-while read -r user; do
-    userHome=$(dscl . read /Users/"$user" NFSHomeDirectory | awk '{print $NF}')
-
-    found_in_exempt_list=false
-
-    for exempt_user in "${exempt_users[@]}"; do
-        if [[ "$user" == "$exempt_user" ]]; then
-            RESULT+=("$(infoOut "Found user $user in exempt list, ignoring...\n")")
-            found_in_exempt_list=true
-            break
-        fi
-    done
-
-     # Check if user is a local admin
-    if ! $found_in_exempt_list; then
-        RESULT+=("$(infoOut "User $user not found in exempt list, checking admin status...\n")")
-        if dseditgroup -o checkmember -u "$user" admin 1 >/dev/null; then
-            RESULT+=("$(infoOut "User $user was found to be a Local Admin, ignoring...\n")")
-        else
-            # Check if user is in targeted list
-            for targeted_user in "${targeted_users[@]}"; do
-                if [[ "$user" == "$targeted_user" ]]; then
-                    RESULT+=("$(infoOut "Found user $user in targeted list, $userHome will be deleted...\n")")
-                    dscl . delete /Users/"$user"
-                    rm -rf "$userHome"
-                    break
-                fi
-            done
-        fi
+    # Demote the LAPS admin account so the admin check below lets it be
+    # removed. The deletion safety checks apply: never the console user, an
+    # exempt account or a system account.
+    if [[ -n "$lapsAdminAccount" ]]; then
+        local laps_removable=0
+        localAccountRemovable "$lapsAdminAccount" || laps_removable=$?
+        case ${laps_removable} in
+            0)
+                infoOut "Demoting $lapsAdminAccount account"
+                /usr/sbin/dseditgroup -o edit -d "$lapsAdminAccount" -t user admin || \
+                    warning "Unable to remove $lapsAdminAccount from the admin group"
+                ;;
+            2) notice "LAPS admin account $lapsAdminAccount does not exist; nothing to demote" ;;
+            *) error "Not demoting $lapsAdminAccount: ${accountRemovalReason}" ;;
+        esac
     fi
-    done < <(dscl . list /Users UniqueID | awk '$2 > 500 {print $1}')
 
-    echo -e "${RESULT[@]}"
+    local user exempt_user targeted_user is_exempt is_targeted
+
+    # Read the list of users with UniqueID greater than 500
+    while read -r user; do
+        [[ -n "$user" ]] || continue
+
+        is_exempt=false
+        for exempt_user in "${exempt_users[@]}"; do
+            if [[ "$user" == "$exempt_user" ]]; then
+                is_exempt=true
+                break
+            fi
+        done
+        if [[ "$is_exempt" == "true" ]]; then
+            infoOut "Found user $user in exempt list, ignoring..."
+            continue
+        fi
+
+        is_targeted=false
+        for targeted_user in "${targeted_users[@]}"; do
+            if [[ -n "$targeted_user" && "$user" == "$targeted_user" ]]; then
+                is_targeted=true
+                break
+            fi
+        done
+        if [[ "$is_targeted" == "true" ]]; then
+            removeTargetedAccount "$user" || true
+        fi
+    done < <(/usr/bin/dscl . -list /Users UniqueID | /usr/bin/awk '$2 > 500 {print $1}')
 
     elif [ "$skipAccountDeletion" = "" ]; then
         infoOut "Skip Account Deletion is set blank, skipping"
@@ -2929,7 +3651,8 @@ function main() {
     fi
 
     findUsersandRemove
-    enrollDeviceReceipt
+    # The "Enrolled Device" receipt is recorded later, by enrollDeviceReceipt,
+    # only once this run has evidence of enrollment (see lib/enrollment.zsh).
 
     if [ -z "$client_id" ] || [ -z "$client_secret" ]; then
         if isDryRun; then

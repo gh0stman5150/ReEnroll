@@ -1,6 +1,85 @@
 [[ -n "${REENROLL_LAPS_MODULE_LOADED:-}" ]] && return
 REENROLL_LAPS_MODULE_LOADED="true"
 
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Local account safety checks
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+# Account names reach dscl as /Users/<name>, so only plain short names are
+# accepted; a name such as "../Groups/admin" must never reach a delete.
+reenrollLocalAccountNamePattern='^[A-Za-z0-9_][A-Za-z0-9._-]*$'
+
+# Prints the first value of a local user record attribute. Reading the plist
+# form keeps values that contain spaces (such as a home folder path) intact.
+function localAccountAttribute() {
+    /usr/bin/dscl -plist . -read "/Users/${1}" "${2}" 2>/dev/null \
+        | /usr/bin/plutil -extract "dsAttrTypeStandard:${2}.0" raw -o - - 2>/dev/null
+}
+
+# Decides whether ReEnroll may delete or demote a local account. Returns 0
+# when it may, 2 when no such account exists and 1 when it must not:
+# an invalid name, a system account (UID below 500), the console user or an
+# account in exempt_users. Sets removableAccountUID and accountRemovalReason.
+# A mistyped Jamf parameter $6 or targeted_users entry is refused here.
+function localAccountRemovable() {
+    local account="$1"
+    local consoleUser exemptUser
+
+    removableAccountUID=""
+    accountRemovalReason=""
+
+    if [[ ! "${account}" =~ ${reenrollLocalAccountNamePattern} ]]; then
+        accountRemovalReason="'${account}' is not a valid local account name"
+        return 1
+    fi
+
+    removableAccountUID="$(localAccountAttribute "${account}" UniqueID)" || removableAccountUID=""
+    if [[ -z "${removableAccountUID}" ]]; then
+        accountRemovalReason="no local account named ${account} exists"
+        return 2
+    fi
+    if [[ "${removableAccountUID}" != <-> ]]; then
+        accountRemovalReason="${account} has an unreadable UID (${removableAccountUID})"
+        return 1
+    fi
+    if (( removableAccountUID < 500 )); then
+        accountRemovalReason="${account} has UID ${removableAccountUID}; accounts below UID 500 are system accounts"
+        return 1
+    fi
+
+    consoleUser="$(liveConsoleUser)" || consoleUser=""
+    if [[ "${account}" == "${loggedInUser:-}" || "${account}" == "${consoleUser}" ]]; then
+        accountRemovalReason="${account} is the console user"
+        return 1
+    fi
+
+    for exemptUser in "${exempt_users[@]}"; do
+        if [[ -n "${exemptUser}" && "${account}" == "${exemptUser}" ]]; then
+            accountRemovalReason="${account} is in exempt_users"
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+# Returns 0 when the account is in the admin group, 1 when dseditgroup reports
+# it is not, and 2 when membership cannot be determined. Callers treat 2 as
+# "leave the account alone".
+function localAccountIsAdmin() {
+    local membership
+
+    membership="$(/usr/sbin/dseditgroup -o checkmember -m "${1}" admin 2>&1)" || true
+    case "${membership}" in
+        "yes "*) return 0 ;;
+        "no "*) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+# Deletes the Jamf-managed LAPS account named by Jamf parameter $6 so the
+# enrollment that follows recreates it. The account must pass
+# localAccountRemovable; the home folder is left in place.
 function deleteLAPSAccount() {
     if isDryRun; then
         dryRunOut "Would delete the LAPS account '${lapsAdminAccount}' if present"
@@ -9,12 +88,31 @@ function deleteLAPSAccount() {
 
     if [ "$skipAccountDeletion" = "false" ]; then
         notice "Skip Account Deletion is set to false, proceeding"
-        if [ -n "$lapsAdminAccount" ]; then
-            notice "Deleting LAPS account: ${lapsAdminAccount}"
-            /usr/bin/dscl . -delete /Users/"$lapsAdminAccount"
-        else
+        if [ -z "$lapsAdminAccount" ]; then
             notice "No LAPS account to delete"
+            return 0
         fi
+
+        local removable=0
+        localAccountRemovable "${lapsAdminAccount}" || removable=$?
+        case ${removable} in
+            0) ;;
+            2)
+                notice "LAPS account ${lapsAdminAccount} does not exist; nothing to delete"
+                return 0
+                ;;
+            *)
+                error "Not deleting LAPS account ${lapsAdminAccount}: ${accountRemovalReason}"
+                return 1
+                ;;
+        esac
+
+        notice "Deleting LAPS account: ${lapsAdminAccount} (UID ${removableAccountUID})"
+        if ! /usr/bin/dscl . -delete "/Users/${lapsAdminAccount}"; then
+            error "Unable to delete LAPS account ${lapsAdminAccount}"
+            return 1
+        fi
+        infoOut "Deleted LAPS account ${lapsAdminAccount}"
     elif [ "$skipAccountDeletion" = "" ]; then
         infoOut "Skip Account Deletion is set blank, skipping"
     else
@@ -168,6 +266,11 @@ function rotateLAPSPassword() {
     fi
     "${jamfBinary}" rotateManagementAccountPassword
 
+    # Jamf Pro needs time to escrow the new password before a check can pass.
+    # This is the only up-front wait; verifyLAPSCredentials checks at once.
+    infoOut "Waiting 60 seconds for Jamf Pro to escrow the rotated LAPS password"
+    sleep 60
+
     verifyLAPSCredentials
 }
 
@@ -186,25 +289,31 @@ function verifyLAPSCredentials() {
     # loop's bound, and the enrollment invitation is sent at most once per
     # run: each invitation deletes the LAPS account, re-enrolls and rotates
     # the password, so repeating it on every failed check looped forever.
+    # The first check runs at once, so a valid account costs no wait; the 60
+    # second pause is only between a failed check and the next one (at most
+    # two checks per call). rotateLAPSPassword waits for escrow itself.
     local LAPScounter=1
-    lap_Status=1
-    until [[ "$lap_Status" -eq 0 ]] || [[ "$LAPScounter" -gt 2 ]]; do
-        scriptResult+="Check ${LAPScounter} of 2: LAPS account not valid; waiting to re-check; "
-        sleep 60
-        checkLAPSAccount "$jssurl" "$management_id" "$apiBearerToken" "$lapsAdminAccount" "$lapsPassword"
-        lap_Status=$?
+    checkLAPSAccount "$jssurl" "$management_id" "$apiBearerToken" "$lapsAdminAccount" "$lapsPassword"
+    lap_Status=$?
 
-        if [[ "$lap_Status" -ne 0 ]]; then
-            if [[ "${lapsReEnrollInvitationSent:-false}" == "true" ]]; then
-                warning "LAPS credentials are still invalid after the enrollment invitation; not sending another"
-            else
-                lapsReEnrollInvitationSent="true"
-                notice "Sending enrollment invitation..."
-                reEnrollInvitation
-            fi
+    while [[ "$lap_Status" -ne 0 ]]; do
+        if [[ "${lapsReEnrollInvitationSent:-false}" == "true" ]]; then
+            warning "LAPS credentials are still invalid after the enrollment invitation; not sending another"
+        else
+            lapsReEnrollInvitationSent="true"
+            notice "Sending enrollment invitation..."
+            reEnrollInvitation
+            # The invitation's own verification sets lap_Status; stop if it
+            # already confirmed the new credentials.
+            [[ "$lap_Status" -eq 0 ]] && break
         fi
 
-        ((LAPScounter++))
+        (( LAPScounter >= 2 )) && break
+        scriptResult+="Check ${LAPScounter} of 2: LAPS account not valid; waiting to re-check; "
+        sleep 60
+        (( LAPScounter++ ))
+        checkLAPSAccount "$jssurl" "$management_id" "$apiBearerToken" "$lapsAdminAccount" "$lapsPassword"
+        lap_Status=$?
     done
 }
 
@@ -252,6 +361,7 @@ function checkLAPSAccountStatus() {
         updateDialog "listitem: title: Sending Enrollment Invitation, icon: SF=person.crop.circle.fill.badge.checkmark,weight=bold, statustext: Invitation Sent, status: success"
         state_set "ReEnrollNotificationStatus" "No Notification"
         webhookStatus="ReEnroll without notification"
+        enrollDeviceReceipt "the Jamf-managed LAPS credentials were verified"
 
         if [[ -z "$reEnrollMethod" ]]; then
             reEnrollMethod="Silent Redeploy of the Jamf Management Framework"

@@ -13,7 +13,9 @@ folder_path="/Library/Application Support/ReEnroll"
 ReEnrollFile="$folder_path/ReEnroll"
 
 if [ -f "${ReEnrollFile}.plist" ]; then
-    ReEnrollEnrolledResults=$(defaults read "${ReEnrollFile}" ReEnrollLastRun | sed 's/.\{6\}$//' 2> /dev/null)
+    # defaults prints the date as "YYYY-MM-DD hh:mm:ss +0000"; drop the " +0000"
+    # offset so Jamf reads it as a Date.
+    ReEnrollEnrolledResults=$(defaults read "${ReEnrollFile}" ReEnrollLastRun 2> /dev/null | sed 's/.\{6\}$//')
     [[ -n "${ReEnrollEnrolledResults}" ]] && echo "<result>${ReEnrollEnrolledResults}</result>"
     [[ -z "${ReEnrollEnrolledResults}" ]] && echo "<result>No ReEnroll last run time</result>"
 else

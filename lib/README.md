@@ -10,9 +10,13 @@ enrollment logic for development and testing.
 
 - `dialog.zsh`: swiftDialog setup and progress-window behavior.
 - `jamf_api.zsh`: Jamf Pro API requests, authentication, and validation.
-- `launchd.zsh`: Deferred launchd workflow generation and management.
+- `launchd.zsh`: Deferred launchd workflow generation and management: the
+  recon LaunchDaemon and the admin guard LaunchDaemon that revokes temporary
+  admin rights if a run ends without revoking them.
 - `webhooks.zsh`: Teams and Slack result notifications.
-- `laps.zsh`: Jamf-managed local administrator password workflows.
+- `laps.zsh`: Jamf-managed local administrator password workflows, and the
+  local account safety checks (`localAccountRemovable`,
+  `localAccountIsAdmin`) applied before any account is deleted or demoted.
 - `enrollment.zsh`: Framework redeployment and enrollment-renewal behavior.
 
 ## Jamf Deployment

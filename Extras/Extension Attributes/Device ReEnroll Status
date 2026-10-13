@@ -13,7 +13,8 @@ folder_path="/Library/Application Support/ReEnroll"
 ReEnrollFile="$folder_path/ReEnroll"
 
 if [ -f "${ReEnrollFile}.plist" ]; then
-    ReEnrollEnrolledResults=$(defaults read "${ReEnrollFile}" DeviceEnrolledStatus | sed 's/.\{20\}$//' 2> /dev/null)
+    # Report the stored value in full, without trimming characters.
+    ReEnrollEnrolledResults=$(defaults read "${ReEnrollFile}" DeviceEnrolledStatus 2> /dev/null)
     [[ -n "${ReEnrollEnrolledResults}" ]] && echo "<result>${ReEnrollEnrolledResults}</result>"
     [[ -z "${ReEnrollEnrolledResults}" ]] && echo "<result>No last discovery</result>"
 else

@@ -13,7 +13,8 @@ folder_path="/Library/Application Support/ReEnroll"
 ReEnrollFile="$folder_path/ReEnroll"
 
 if [ -f "${ReEnrollFile}.plist" ]; then
-    ReEnrollEnrolledResults=$(defaults read "${ReEnrollFile}" ReEnrollRenewProfilesDialog | sed 's/.\{30\}$//' 2> /dev/null)
+    # Report the stored value in full, without trimming characters.
+    ReEnrollEnrolledResults=$(defaults read "${ReEnrollFile}" ReEnrollRenewProfilesDialog 2> /dev/null)
     [[ -n "${ReEnrollEnrolledResults}" ]] && echo "<result>${ReEnrollEnrolledResults}</result>"
     [[ -z "${ReEnrollEnrolledResults}" ]] && echo "<result>No Renew Profiles Dialog</result>"
 else

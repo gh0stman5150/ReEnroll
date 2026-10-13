@@ -1,9 +1,28 @@
 [[ -n "${REENROLL_ENROLLMENT_MODULE_LOADED:-}" ]] && return
 REENROLL_ENROLLMENT_MODULE_LOADED="true"
 
+# Records DeviceEnrolledStatus "Enrolled Device" (read by the "Device ReEnroll
+# Status" extension attribute and the smart groups built on it). Called only
+# once this run has evidence of enrollment: Jamf Pro accepted the framework
+# redeploy, jamf enroll accepted the invitation, the console user accepted
+# the enrollment renewal, or the Jamf check-in or LAPS credentials were
+# verified. A run that fails before any of these leaves the earlier value.
+# The accepted-action cases record before the enrollment's own inventory, so
+# the smart-group exclusion applies to the policies that enrollment triggers.
 function enrollDeviceReceipt() {
-    infoOut "Adding device enrolled receipt"
+    local reason="${1:-enrollment was verified}"
+
+    if isDryRun; then
+        dryRunOut "Would record the device enrolled receipt because ${reason}"
+        return 0
+    fi
+    if [[ "${deviceEnrolledReceiptRecorded:-false}" == "true" ]]; then
+        return 0
+    fi
+
+    infoOut "Adding device enrolled receipt: ${reason}"
     state_set "DeviceEnrolledStatus" "Enrolled Device"
+    deviceEnrolledReceiptRecorded="true"
 }
 
 # Called only from failure paths (check-in, inventory and LAPS validation
@@ -63,7 +82,7 @@ function inventoryError() {
     webhookStatus="ReEnroll with notification"
     reEnrollMethod="Notification for Renewing Enrollment"
 
-    if [[ "${osMajorVersion}" -ge 12 ]] && [[ -e "/Library/Application Support/Dialog/Dialog.app" ]]; then
+    if [[ "${osMajorVersion}" -ge 12 ]] && [[ -e "${dialogAppPath:-/Library/Application Support/Dialog/Dialog.app}" ]]; then
         infoOut "Sending Dialog notification for updating profiles"
         jamfProfileRenew
 
@@ -80,7 +99,11 @@ function inventoryError() {
                 infoOut "Checking user admin status to renew profiles"
                 addAdmin
                 sleep 5
-                triggerEnrollment
+                if triggerEnrollment; then
+                    enrollDeviceReceipt "${loggedInUser:-the console user} accepted the enrollment renewal"
+                else
+                    warning "Unable to start the enrollment renewal for ${loggedInUser:-the console user}; not recording the device as enrolled."
+                fi
                 deleteLAPSAccount
                 updateDialog "listitem: title: Jamf Update Needed, icon: SF=arrow.clockwise.icloud.fill,weight=bold, statustext: Update Pending, status: pending"
                 updateDialog "progresstext: Update command sent. Waiting for response..."
@@ -165,6 +188,7 @@ function reEnrollInvitation() {
         if [ -n "$lapsAdminAccount" ]; then
             deleteLAPSAccount
         fi
+        enrollDeviceReceipt "jamf enroll accepted the enrollment invitation"
         rotateLAPSPassword
         return 0
     fi
@@ -172,34 +196,101 @@ function reEnrollInvitation() {
     if [ "$enrollmentInvitation" = "" ] || [ "$sendEnrollmentInvitation" = "false" ]; then
         error "Enrollment invitation is empty, not sending invitation"
         updateDialog "The enrollment invitation is empty or incorrect, unable to send invitation"
-    else
-        infoOut "Send Enrollment Invitation is set to true and enrollment invitation is not empty"
-        updateDialog "listitem: add, title: Sending Enrollment Invitation, icon: SF=paperplane.circle.fill,weight=bold, statustext: Sending …, status: wait"
-        updateDialog "listitem: delete, title: ReEnroll in progress …,"
-        updateDialog "progresstext: Sending Enrollment Invitation..."
-
-        if [ "$lapsAdminAccount" = "" ]; then
-            notice "LAPS Admin Account is empty, not deleting LAPS account"
-        else
-            infoOut "Deleting ${lapsAdminAccount}"
-            deleteLAPSAccount
-        fi
-
-        infoOut "Sending Silent Enrollment Invitation"
-        if [[ -z "${jamfBinary}" || ! -x "${jamfBinary}" ]]; then
-            error "The Jamf binary is unavailable; the enrollment invitation cannot be sent locally."
-            return 1
-        fi
-        "${jamfBinary}" enroll -invitation "$enrollmentInvitation" -noRecon -noPolicy
-        updateDialog "listitem: title: Sending Enrollment Invitation, icon: SF=person.crop.circle.fill.badge.checkmark,weight=bold, statustext: Invitation Sent, status: success"
-        updateDialog "progresstext: Enrollment Invitation Sent"
-        state_set "ReEnrollMethod" "Enrollment Invitation"
-
-        reEnrollMethod="Sending Silent Enrollment Invitation"
-        webhookStatus="ReEnroll without notification"
-
-        rotateLAPSPassword
+        return 1
     fi
+
+    # Check the Jamf binary before anything destructive: the LAPS account is
+    # deleted below and only a successful enrollment recreates it. The
+    # framework redeploy earlier in this run may have installed the binary.
+    if [[ -z "${jamfBinary:-}" || ! -x "${jamfBinary}" ]]; then
+        jamfBinary="$(findJamfBinary || true)"
+    fi
+    if [[ -z "${jamfBinary}" || ! -x "${jamfBinary}" ]]; then
+        error "The Jamf binary is unavailable; the enrollment invitation cannot be sent locally. The LAPS account was left in place."
+        return 1
+    fi
+
+    infoOut "Send Enrollment Invitation is set to true and enrollment invitation is not empty"
+    updateDialog "listitem: add, title: Sending Enrollment Invitation, icon: SF=paperplane.circle.fill,weight=bold, statustext: Sending …, status: wait"
+    updateDialog "listitem: delete, title: ReEnroll in progress …,"
+    updateDialog "progresstext: Sending Enrollment Invitation..."
+
+    if [ "$lapsAdminAccount" = "" ]; then
+        notice "LAPS Admin Account is empty, not deleting LAPS account"
+    else
+        infoOut "Deleting ${lapsAdminAccount}"
+        deleteLAPSAccount
+    fi
+
+    infoOut "Sending Silent Enrollment Invitation"
+    local enrollExit
+    "${jamfBinary}" enroll -invitation "$enrollmentInvitation" -noRecon -noPolicy
+    enrollExit=$?
+    if (( enrollExit != 0 )); then
+        # Record nothing and skip the LAPS rotation: there is no new
+        # enrollment for the plist, extension attribute or webhook to report.
+        error "The enrollment invitation failed (jamf enroll exit ${enrollExit}); not recording it or rotating the LAPS password."
+        updateDialog "listitem: title: Sending Enrollment Invitation, icon: SF=exclamationmark.icloud.fill,weight=bold, statustext: Invitation Failed, status: fail"
+        updateDialog "progresstext: Enrollment Invitation failed"
+        reEnrollMethod="Silent Enrollment Invitation failed"
+        return 1
+    fi
+
+    updateDialog "listitem: title: Sending Enrollment Invitation, icon: SF=person.crop.circle.fill.badge.checkmark,weight=bold, statustext: Invitation Sent, status: success"
+    updateDialog "progresstext: Enrollment Invitation Sent"
+    state_set "ReEnrollMethod" "Enrollment Invitation"
+    enrollDeviceReceipt "jamf enroll accepted the enrollment invitation"
+
+    reEnrollMethod="Sending Silent Enrollment Invitation"
+    webhookStatus="ReEnroll without notification"
+
+    rotateLAPSPassword
+}
+
+# Prints the PIDs of this script's ancestors, nearest first. The jamf process
+# that runs this policy is one of them.
+function reenrollAncestorPids() {
+    local pid="$$" parent
+    local -i depth=0
+    while [[ "${pid}" == <2-> ]] && (( depth++ < 64 )); do
+        parent="$(/bin/ps -o ppid= -p "${pid}" 2>/dev/null)"
+        parent="${parent//[[:space:]]/}"
+        [[ "${parent}" == <1-> ]] || break
+        print -r -- "${parent}"
+        pid="${parent}"
+    done
+}
+
+# Stops the enrollment check-in that the framework redeploy or invitation
+# started, so inventory can be submitted without waiting for every
+# enrollmentComplete policy. A plain "pkill jamf" also killed the jamf process
+# running this policy (aborting its log upload), the jamf launch daemon and
+# unrelated policy runs, so only non-ancestor jamf processes whose arguments
+# show an enrollment run are signalled.
+function terminateEnrollmentCheckIn() {
+    local pid args
+    local -a ancestors jamfPids
+
+    ancestors=( ${(f)"$(reenrollAncestorPids)"} )
+    jamfPids=( ${(f)"$(/usr/bin/pgrep -x jamf 2>/dev/null)"} )
+
+    for pid in "${jamfPids[@]}"; do
+        [[ "${pid}" == <1-> ]] || continue
+        if (( ${ancestors[(Ie)${pid}]} )); then
+            infoOut "Leaving jamf process ${pid} running; it is running this policy"
+            continue
+        fi
+        args="$(/bin/ps -o args= -p "${pid}" 2>/dev/null)"
+        case "${args}" in
+            *" enroll"|*" enroll "*|*enrollmentComplete*)
+                infoOut "Terminating enrollment check-in (jamf process ${pid})"
+                kill "${pid}" 2>/dev/null || warning "Unable to terminate jamf process ${pid}"
+                ;;
+            *)
+                infoOut "Leaving unrelated jamf process ${pid} running"
+                ;;
+        esac
+    done
 }
 
 function checkIn() {
@@ -258,13 +349,15 @@ function checkIn() {
         if [[ "${policyStatus}" = "yes" ]]; then
             infoOut "Jamf Pro Policy Connection is stable, proceeding"
             updateDialog "listitem: title: • Policy Status, icon: SF=icloud.and.arrow.up.fill,weight=bold, statustext: Connected, status: success"
+            # Before the recon below, so the inventory it submits carries it.
+            enrollDeviceReceipt "the Jamf Pro policy check-in was verified"
         else
             error "Unable to verify Jamf Pro Policy Check In, proceeding"
             updateDialog "listitem: title: • Policy Status, icon: SF=exclamationmark.icloud.fill, statustext: Unable to Verify, status: error"
         fi
 
         infoOut "Terminating Jamf Check-In"
-        pkill jamf
+        terminateEnrollmentCheckIn
 
         sleep 5
         updateDialog "listitem: title: Jamf Connection Status, icon: SF=icloud.and.arrow.up.fill,weight=bold, statustext: Check 3 of 3, status: wait"
@@ -277,7 +370,16 @@ function checkIn() {
             inventoryStatus="not installed"
             return 1
         fi
-        "${jamfBinary}" recon -endUsername "${networkUser}" --verbose >> "${tempInventoryLog}"
+        local reconUser
+        local -a reconArgs
+        reconArgs=(recon)
+        reconUser="$(reconEndUsername)"
+        if [[ -n "${reconUser}" ]]; then
+            reconArgs+=(-endUsername "${reconUser}")
+        else
+            notice "No network user for ${loggedInUser:-the console user}; submitting inventory without -endUsername"
+        fi
+        "${jamfBinary}" "${reconArgs[@]}" --verbose >> "${tempInventoryLog}"
 
         validateInventory
         counterInventory=1
@@ -316,20 +418,28 @@ function checkIn() {
     fi
 }
 
+# Restores the site recorded before redeployment (originalComputerSiteID, read
+# from the ReEnroll plist). computerSiteID holds the live site and is used only
+# for the log, so a site changed by redeployment is put back.
 function computerSiteUpdate() {
     if isDryRun; then
-        dryRunOut "Would update the computer back to its original Jamf site ID '${computerSiteID}'"
+        dryRunOut "Would update the computer back to its original Jamf site ID '${originalComputerSiteID}'"
         return 0
     fi
 
-    infoOut "Computer has an original Site: ($originalComputerSite), site ID: ($originalComputerSiteID)"
+    if [[ "${originalComputerSiteID}" != <1-> || "${computerID}" != <1-> ]]; then
+        error "Cannot restore the original Jamf site: site ID '${originalComputerSiteID}', computer ID '${computerID}'."
+        return 1
+    fi
+
+    infoOut "Computer has an original Site: ($originalComputerSite), site ID: ($originalComputerSiteID); current site ID: (${computerSiteID})"
     if ! jamfApiRequest PATCH "${jssurl}api/${jamfInventoryApiVersion}/computers-inventory-detail/${computerID}" \
         --header "Authorization: Bearer $apiBearerToken" \
         --header 'accept: application/json' \
         --header 'Content-Type: application/json' \
         --data "{
         \"general\": {
-            \"siteId\": \"$computerSiteID\"
+            \"siteId\": \"$originalComputerSiteID\"
         }
         }"; then
         error "Unable to restore the original Jamf site (HTTP ${JAMF_HTTP_STATUS})."
@@ -379,16 +489,27 @@ function updatedComputerInventoryInfo() {
         infoOut "Update computer site is set to true, verifying and updating computer Site"
         getAccessToken
         checkTokenExpiration
-        apiResponse
-        computerIDLookup
-        computerInventoryInfo
+        # Without a fresh lookup computerID and the inventory are empty or
+        # stale; stop instead of PATCHing a missing ID.
+        if ! apiResponse || ! computerIDLookup; then
+            error "Unable to look up this computer in Jamf Pro; not updating its site."
+            quitScript
+            return 1
+        fi
+        # Read the live site without replacing the original recorded before
+        # redeployment, so a failed restore leaves the original in the plist.
+        computerInventoryInfo "false"
         if [ ! "$newComputerSiteID" = "" ]; then
-            newComputerSiteUpdate
-            notice "New Computer Site ID: $newComputerSiteID"
-        elif [ "$originalComputerSiteID" -gt "1" ]; then
-            computerSiteUpdate
-            notice "The computer ($serialNumber) was updated to the original site ($originalComputerSite)."
-        elif [ "$originalComputerSiteID" -lt "0" ]; then
+            if newComputerSiteUpdate; then
+                notice "New Computer Site ID: $newComputerSiteID"
+            fi
+        elif [[ "$originalComputerSiteID" == <1-> ]]; then
+            if [[ "$computerSiteID" == "$originalComputerSiteID" ]]; then
+                notice "The computer ($serialNumber) is already in its original site ($originalComputerSite)."
+            elif computerSiteUpdate; then
+                notice "The computer ($serialNumber) was updated to the original site ($originalComputerSite)."
+            fi
+        elif [[ "$originalComputerSiteID" == -<1-> ]]; then
             notice "The computer ($serialNumber) Site was set to none."
         else
             error "The computer was not updated to the original site"
